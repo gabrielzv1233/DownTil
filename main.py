@@ -740,12 +740,49 @@ def job_status(jid):
 @app.route("/job/<jid>/file")
 def job_file(jid):
     j = JOBS.get(jid)
-    if not j or not j.get("filepath"): abort(404)
+    if not j or not j.get("filepath") or not os.path.exists(j["filepath"]):
+        abort(404)
     disp = j.get("display_name")
     if not disp:
         title_guess = (j.get("title") or "download").split(" - ", 1)[-1]
         ext = os.path.splitext(j["filepath"])[1].lstrip(".") or "bin"
         disp = sanitize(title_guess, ext)
     return send_file(j["filepath"], as_attachment=True, download_name=disp)
+
+CACHE_CLEAR_INTERVAL_HOURS = 6  
+
+def clear_cache_loop():
+    while True:
+        time.sleep(CACHE_CLEAR_INTERVAL_HOURS * 3600)
+        try:
+            removed = 0
+            for fn in os.listdir(DOWNLOAD_DIR):
+                try:
+                    os.remove(os.path.join(DOWNLOAD_DIR, fn))
+                    removed += 1
+                except:
+                    pass
+
+            removed_refs = 0
+            with JOBS_LOCK:
+                for jid, j in list(JOBS.items()):
+                    fp = j.get("filepath")
+                    if not fp:
+                        continue
+                    if not os.path.exists(fp):
+                        j["filepath"] = None
+                        j["stage"] = "expired"
+                        j["error"] = "File removed from cache"
+                        k = j.get("key")
+                        if k and JOB_KEYS.get(k) == jid:
+                            JOB_KEYS.pop(k, None)
+                        removed_refs += 1
+            if removed_refs:
+                app.logger.info(f"Pruned {removed_refs} job file references (expired cache).")
+            app.logger.info(f"Cache cleared: {removed} files removed from {DOWNLOAD_DIR}")
+        except Exception as e:
+            app.logger.error(f"Cache clear failed: {e}")
+
+threading.Thread(target=clear_cache_loop, daemon=True).start()
 
 app.run(host='0.0.0.0', port=80, debug=False)
