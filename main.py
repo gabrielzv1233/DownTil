@@ -1,6 +1,7 @@
+
+from flask import Flask, request, redirect, abort, send_file, jsonify
 import os, re, html, json, threading, secrets, time, glob, queue
 from urllib.parse import urlparse
-from flask import Flask, request, redirect, abort, send_file, jsonify
 import yt_dlp, requests
 
 app = Flask(__name__)
@@ -38,6 +39,13 @@ def redirect_home(reason: str):
     app.logger.warning(reason)
     return redirect("/")
 
+COOKIES_PATH = os.path.abspath(os.environ.get("COOKIES_FILE", "./cookies.txt"))
+COOKIES_OK = os.path.isfile(COOKIES_PATH)
+if COOKIES_OK:
+    app.logger.info(f"Using cookies file: {COOKIES_PATH}")
+else:
+    app.logger.warning(f"cookies.txt not found at {COOKIES_PATH}; proceeding without cookies")
+
 def ydl_opts_base(extra=None, outtmpl=None):
     base = {
         "quiet": True,
@@ -62,9 +70,11 @@ def ydl_opts_base(extra=None, outtmpl=None):
         "windowsfilenames": True,
         "cachedir": False,
     }
-    if extra: base.update(extra)
+    if COOKIES_OK:
+        base["cookiefile"] = COOKIES_PATH
+    if extra:
+        base.update(extra)
     return base
-
 
 def new_job(kind, title="Preparing…", key=None, display_name=None):
     jid = secrets.token_hex(8)
@@ -141,7 +151,7 @@ def tag_for(kind):
     return {
         "yt-highest": "highest",
         "yt-hd": "hd",
-        "yt-audio": "audio",
+        "yt-audio": "mp3",
         "tt-video": "video",
         "sc-mp3": "mp3",
     }.get(kind)
@@ -150,7 +160,7 @@ def ext_for_kind(kind):
     return {
         "yt-highest": "mp4",
         "yt-hd": "mp4",
-        "yt-audio": "m4a",
+        "yt-audio": "mp3",
         "tt-video": "mp4",
         "sc-mp3": "mp3",
     }.get(kind, "mp4")
@@ -538,10 +548,11 @@ def yt_opts(mode):
         fmt = "bestaudio/best"
     else:
         raise ValueError("bad mode")
+
     opts = {"format": fmt}
     if mode == "audio":
         opts["postprocessors"] = [
-            {"key":"FFmpegExtractAudio","preferredcodec":"m4a","preferredquality":"0"},
+            {"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"0"},
             {"key":"FFmpegMetadata"}
         ]
     else:
@@ -549,6 +560,7 @@ def yt_opts(mode):
             {"key":"FFmpegVideoRemuxer","preferedformat":"mp4"}
         ]
     return opts
+
 
 def job_key(kind, info_id):
     return f"{kind}:{info_id}"
