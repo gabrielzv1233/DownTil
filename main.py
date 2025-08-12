@@ -365,15 +365,16 @@ a.link{{color:#a7b3ff;text-decoration:none}}
 </script>
 </body></html>"""
 
-def detail_page(info, buttons):
+def detail_page(info, buttons, media_html=None):
     title = info.get("title") or "Untitled"
     creator = info.get("uploader") or info.get("channel") or info.get("artist") or "Unknown"
     thumb = pick_thumb(info)
     btn_html = "".join([f'<a class="btn" href="{html.escape(href)}">{html.escape(lbl)}</a>' for lbl, href in buttons])
+    media_block = media_html if media_html is not None else (f'<img class="thumb" src="{html.escape(thumb)}" />' if thumb else '')
     body = f"""
     <div class="card">
       <div class="row">
-        {'<img class="thumb" src="'+html.escape(thumb)+'" />' if thumb else ''}
+        {media_block}
         <div class="meta">
           <h1>{html.escape(title)}</h1>
           <h2>{html.escape(creator)}</h2>
@@ -510,7 +511,13 @@ def yt_detail(info):
     s_url, s_ext, s_lang = default_sub(info)
     if s_url: buttons.append((f"Subtitles ({s_lang.upper()})", f"/yt/{vid}/subs"))
     if pick_thumb(info): buttons.append(("Thumbnail", f"/yt/{vid}/thumb"))
-    return detail_page(info, buttons)
+
+    embed = f'''<iframe class="thumb"
+        src="https://www.youtube.com/embed/{html.escape(vid)}?rel=0"
+        title="YouTube video player" frameborder="0"
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+        allowfullscreen loading="lazy" referrerpolicy="origin-when-cross-origin"></iframe>'''
+    return detail_page(info, buttons, media_html=embed)
 
 @app.route("/yt/<vid>/thumb")
 def yt_thumb(vid):
@@ -784,4 +791,4 @@ def clear_cache_loop():
 
 threading.Thread(target=clear_cache_loop, daemon=True).start()
 
-app.run(host='0.0.0.0', port=80, debug=False)
+app.run(host='0.0.0.0', port=80, debug=False, use_reloader=True)
