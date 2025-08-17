@@ -1,7 +1,7 @@
+from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TPE2, TALB, TIT2, TRCK, TPOS, TCON, TDRC
+import os, re, html, json, threading, secrets, time, glob, queue, yt_dlp, requests
 from flask import Flask, request, redirect, abort, send_file, jsonify
-import os, re, html, json, threading, secrets, time, glob, queue
 from urllib.parse import urlparse
-import yt_dlp, requests
 
 app = Flask(__name__)
 app.url_map.strict_slashes = False
@@ -19,14 +19,14 @@ for fn in os.listdir(DOWNLOAD_DIR):
     try: os.remove(os.path.join(DOWNLOAD_DIR, fn))
     except: pass
 
-JOBS = {}
-JOBS_LOCK = threading.Lock()
-JOB_KEYS = {}
-PENDING = []
 PENDING_LOCK = threading.Lock()
+ACTIVE_LOCK = threading.Lock()
+JOBS_LOCK = threading.Lock()
 TASKQ = queue.Queue()
 ACTIVE = set()
-ACTIVE_LOCK = threading.Lock()
+JOB_KEYS = {}
+PENDING = []
+JOBS = {}
 
 # ---------------- utils ----------------
 def sanitize(name: str, ext: str = ""):
@@ -145,6 +145,78 @@ def default_sub(info):
         s = autos[k][0]; return (s.get("url"), s.get("ext") or "vtt", k)
     return (None, None, None)
 
+from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TPE2, TALB, TIT2, TRCK, TPOS, TCON, TDRC, COMM
+
+def is_sc_url_comment(comm_frame: COMM) -> bool:
+    try:
+        t = (comm_frame.text or [""])[0]
+        return ("soundcloud.com/" in t) or t.startswith("https://api.soundcloud.com/") or t.startswith("http://api.soundcloud.com/")
+    except Exception:
+        return False
+
+def valid_genre_value(info, artist_guess):
+    g = (info.get("genre") or "").strip()
+    if not g:
+        return None
+    bads = { (artist_guess or "").replace(" ", "").lower(),
+             (info.get("uploader_id") or "").replace(" ", "").lower(),
+             (info.get("uploader") or "").replace(" ", "").lower() }
+    if g.replace(" ", "").lower() in bads:
+        return None
+    if len(g) > 64:
+        return None
+    return g
+
+def sc_write_id3(mp3_path, info):
+    try:
+        try:
+            tags = ID3(mp3_path)
+        except ID3NoHeaderError:
+            tags = ID3()
+
+        title = info.get("title") or os.path.splitext(os.path.basename(mp3_path))[0]
+        artist = (info.get("artist") or info.get("uploader") or info.get("creator") or info.get("uploader_id") or "Unknown")
+
+        album = (info.get("album") or info.get("playlist_title") or info.get("album_title") or None)
+        if not album:
+            album = f"{title} - Single"
+
+        track_no = info.get("track_number") or info.get("playlist_index") or 1
+        disc_no  = info.get("disc_number") or 1
+
+        date_raw = info.get("release_date") or info.get("upload_date")
+        date_tag = None
+        if isinstance(date_raw, str) and len(date_raw) == 8 and date_raw.isdigit():
+            date_tag = f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+
+        preserved_comments = []
+        for f in list(tags.getall("COMM")):
+            if not is_sc_url_comment(f):
+                preserved_comments.append(f)
+        tags.delall("COMM")
+        for f in preserved_comments:
+            tags.add(f)
+
+        tags.delall("TIT2"); tags.add(TIT2(encoding=3, text=title))
+        tags.delall("TPE1"); tags.add(TPE1(encoding=3, text=artist))
+        tags.delall("TPE2"); tags.add(TPE2(encoding=3, text=artist))
+        tags.delall("TALB"); tags.add(TALB(encoding=3, text=album))
+
+        tags.delall("TRCK"); tags.add(TRCK(encoding=3, text=str(track_no)))
+        tags.delall("TPOS"); tags.add(TPOS(encoding=3, text=str(disc_no)))
+
+        vg = valid_genre_value(info, artist)
+        tags.delall("TCON")
+        if vg:
+            tags.add(TCON(encoding=3, text=vg))
+
+        if date_tag:
+            tags.delall("TDRC"); tags.add(TDRC(encoding=3, text=date_tag))
+
+        tags.save(mp3_path)
+    except Exception:
+        pass
+
 # ---------- file reuse ----------
 def tag_for(kind):
     return {
@@ -225,6 +297,11 @@ def run_download(jid, url, opts):
                 title = info.get("title") or "download"
                 ext = ext_for_kind(job.get("kind"))
                 disp = sanitize(title, ext)
+
+            kind = job.get("kind") or ""
+            if kind.startswith("sc-") and fpath.lower().endswith(".mp3"):
+                sc_write_id3(fpath, info)
+
             set_job(jid, stage="ready", progress=100.0, filepath=fpath,
                     filename=os.path.basename(fpath), display_name=disp)
     except Exception as e:
@@ -295,12 +372,12 @@ body {{
 
 /* SEARCH */
 .search{{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:10px 12px;margin-bottom:16px;}}
-.search input{{width:100%;background:transparent;border:0;outline:0;color:var(--text);font-size:16px}}
+.search input{{width:100%;background:transparent;border:0;outline:0;color:var(--text);font-size:1 6px}}
 
 /* CARDS */
 .card{{background:var(--card2);border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 10px 40px #0006}}
 .row{{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}}
-.thumb{{width:320px;max-width:100%;aspect-ratio:16/9;border-radius:14px;border:1px solid var(--border);object-fit:cover;background:#000}}
+.thumb{{width:320px;max-width:100%;aspect-ratio:16/9;border-radius:14px;border:1px solid var(--border);object-fit:contain;background:#000}}
 .meta{{flex:1;min-width:260px}}
 h1{{margin:0 0 6px;font-size:20px;letter-spacing:.2px}}
 h2{{margin:0;color:var(--muted);font-size:14px;font-weight:500}}
@@ -408,6 +485,7 @@ def job_page(jid):
             </div>
             <div id="done" style="margin-top:12px;display:none">
                 <a class="btn" id="download" href="#">Download</a>
+                <a class="btn" href="javascript:history.back()">Back</a>
             </div>
             <div id="err" class="small" style="margin-top:10px;color:#ff9a9a;display:none"></div>
           </div>
@@ -416,7 +494,8 @@ def job_page(jid):
     </div>
     <script>
     const jid = {json.dumps(jid)};
-    const owner = {own};
+    const redir = new URLSearchParams(location.search).get('redir') === '1';
+    const backUrl = document.referrer || "/";
     const bar = document.getElementById('bar');
     const pct = document.getElementById('pct');
     const stage = document.getElementById('stage');
@@ -426,34 +505,52 @@ def job_page(jid):
     const done = document.getElementById('done');
     const err = document.getElementById('err');
     const dl = document.getElementById('download');
+
+    function triggerDownloadAndReturn(fileUrl) {{
+      try {{
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = fileUrl;
+        document.body.appendChild(iframe);
+      }} catch (_e) {{}}
+      setTimeout(() => {{ window.location.href = backUrl; }}, redir ? 600 : 1200);
+    }}
+
+    async function handleStatus(j) {{
+      if (j.error) {{ err.style.display='block'; err.textContent=j.error; return true; }}
+      qpos.textContent = j.queue_position || 0;
+      bar.style.width = (j.progress||0).toFixed(1)+'%';
+      pct.textContent = (j.progress||0).toFixed(1)+'%';
+      stage.textContent = j.stage || '';
+      speed.textContent = j.speed_human || '';
+      eta.textContent = (j.eta !== null && j.eta !== undefined) ? (' • ETA ' + Number(j.eta).toFixed(2) + 's') : '';
+      if (j.ready && j.file_url) {{
+        done.style.display='block';
+        dl.href = j.file_url;
+        // Auto-download for ANY visitor, then go back
+        triggerDownloadAndReturn(j.file_url);
+        return true;
+      }}
+      return false;
+    }}
+
     async function poll(){{
       try {{
-        const r = await fetch('/job/'+jid+'/status');
+        const r = await fetch('/job/'+jid+'/status', {{ cache: 'no-store' }});
         const j = await r.json();
-        if (j.error) {{ err.style.display='block'; err.textContent=j.error; return; }}
-        qpos.textContent = j.queue_position || 0;
-        bar.style.width = (j.progress||0).toFixed(1)+'%';
-        pct.textContent = (j.progress||0).toFixed(1)+'%';
-        stage.textContent = j.stage || '';
-        speed.textContent = j.speed_human || '';
-        eta.textContent = (j.eta !== null && j.eta !== undefined) ? (' • ETA ' + Number(j.eta).toFixed(2) + 's') : '';
-        if (j.ready && j.file_url) {{
-          done.style.display='block';
-          dl.href = j.file_url;
-          if (owner === 1) {{
-            window.location.href = j.file_url; // auto-download for creator
-          }}
-          return;
-        }}
+        const finished = await handleStatus(j);
+        if (!finished) setTimeout(poll, 600);
       }} catch(e) {{
-        err.style.display='block'; err.textContent='Lost connection.'; return;
+        err.style.display='block'; err.textContent='Lost connection.'; 
       }}
-      setTimeout(poll, 600);
     }}
+
+    // Kick once immediately (covers the "already completed" case), then poll
     poll();
     </script>
     """
     return page_shell(body, "Processing…")
+
 
 # ---------- homepage ----------
 @app.route("/")
@@ -582,7 +679,7 @@ def reuse_or_redirect(kind, info, title, url, opts, owner=True):
             jid = new_job(kind, title=title, key=job_key(kind, vid), display_name=disp)
             set_job(jid, stage="ready", progress=100.0, filepath=existing,
                     filename=os.path.basename(existing))
-            return redirect(f"/job/{jid}?own={'1' if owner else '0'}")
+            return redirect(f"/job/{jid}?own=1&redir=1")
 
     key = job_key(kind, vid)
     with JOBS_LOCK:
@@ -791,4 +888,4 @@ def clear_cache_loop():
 
 threading.Thread(target=clear_cache_loop, daemon=True).start()
 
-app.run(host='0.0.0.0', port=80, debug=False, use_reloader=True)
+app.run(host='0.0.0.0', port=80, debug=False, use_reloader=True)    
