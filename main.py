@@ -1,6 +1,6 @@
 from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TPE2, TALB, TIT2, TRCK, TPOS, TCON, TDRC
-import os, re, html, json, threading, secrets, time, glob, queue, yt_dlp, requests
-from flask import Flask, request, redirect, abort, send_file, jsonify
+import os, re, html, json, threading, secrets, time, glob, queue, yt_dlp, requests, importlib.metadata
+from flask import Flask, request, redirect, abort, send_file, jsonify, send_from_directory
 from urllib.parse import urlparse
 
 app = Flask(__name__)
@@ -28,7 +28,49 @@ JOB_KEYS = {}
 PENDING = []
 JOBS = {}
 
+app = Flask(__name__)
+
 # ---------------- utils ----------------
+
+@app.get("/favicon.png")
+def favicon():
+    return send_from_directory("icon.png", mimetype="image/png", max_age=86400)
+
+ADMIN_IPS = ["192.168.1.170", "127.0.0.1"]
+
+def is_local(ip):
+    return ip in ADMIN_IPS
+
+def ytdlp_updated() -> bool:
+    try:
+        local = importlib.metadata.version("yt-dlp")
+    except importlib.metadata.PackageNotFoundError:
+        return False  # not installed
+
+    resp = requests.get("https://pypi.org/pypi/yt-dlp/json", timeout=5)
+    resp.raise_for_status()
+    latest = resp.json()["info"]["version"]
+
+    return local == latest, local, latest
+
+@app.route("/server/")
+def admin():
+    if not is_local(request.remote_addr):
+        return abort(403)
+    else:
+        updated, localver, latestver = ytdlp_updated()
+        hmsg = '' if not updated else 'title="YT-DLP is up to date"'
+        return page_shell(
+    f"""
+    <div class="card">
+        <h1>YT-DLP status</h1>
+        {'' if updated else '<h2 style="color:orange;font-size:105%;margin-bottom:6px;", title="Not updating may prevent DownTil from working propperly">Update available!</h2>'}
+            <h2 {hmsg}>Version: {localver}</h2>
+            <h2 {hmsg}>Latest: {latestver}</h2>
+        <br>
+    </div>
+    """, "Server Status", "Stats are not live and only show details from time of page load.")
+
 def sanitize(name: str, ext: str = ""):
     name = (name or "download").strip()
     name = re.sub(ILLEGAL, "_", name).rstrip(".")
@@ -311,6 +353,7 @@ def run_download(jid, url, opts):
             ACTIVE.discard(jid)
 
 # ---------- job queue / workers ----------
+
 def queue_position(jid):
     with PENDING_LOCK:
         try:
@@ -344,7 +387,8 @@ for _ in range(max(1, MAX_WORKERS)):
     threading.Thread(target=worker_loop, daemon=True).start()
 
 # ---------- UI ----------
-def page_shell(body_html, title=""):
+
+def page_shell(body_html, title="", footer="Files are processed on server. Already-processed files are cached and reused."):
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -352,6 +396,7 @@ def page_shell(body_html, title=""):
 <meta name="theme-color" content="#0b0b0c">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="format-detection" content="telephone=no,email=no,address=no">
+<link rel="icon" type="image/png" href="/favicon.png">
 
 <title>{html.escape(title or "DownTil")}</title>
 <style>
@@ -414,7 +459,7 @@ a.link{{color:#a7b3ff;text-decoration:none}}
     <input id="qinput" type="url" name="q" placeholder="Paste YouTube / TikTok / SoundCloud URL…" value="{html.escape(request.args.get('q') or '')}">
   </form>
   {body_html}
-  <div class="footer">Files are processed on server. Already-processed files are cached and reused.</div>
+  <div class="footer">{html.escape(footer)}</div>
 </div>
 <script>
 (function(){{
@@ -886,6 +931,31 @@ def clear_cache_loop():
         except Exception as e:
             app.logger.error(f"Cache clear failed: {e}")
 
+@app.route("/json/")
+def troll_json():
+    ip = request.remote_addr
+    ua = request.headers.get("User-Agent", "Unknown")
+
+    print(f"[HONEYPOT HIT] IP={ip}, UA={ua}")
+
+    return jsonify({
+        "status": "success",
+        "country": "Shrek’s Swamp",
+        "countryCode": "OG",
+        "region": "ON",
+        "regionName": "Onions",
+        "city": "Far Far Away",
+        "zip": "69420",
+        "lat": 69.420,
+        "lon": -69.420,
+        "timezone": "Ogre/Donkey",
+        "isp": "Dreamworks Internet",
+        "org": "Big Green Data Centers",
+        "as": "AS420 OGR",
+        "query": ip
+    })
+            
 threading.Thread(target=clear_cache_loop, daemon=True).start()
 
-app.run(host='0.0.0.0', port=80, debug=False, use_reloader=True)    
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=80, debug=False, use_reloader=True)
