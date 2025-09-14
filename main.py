@@ -1,6 +1,6 @@
-from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TPE2, TALB, TIT2, TRCK, TPOS, TCON, TDRC
 import os, re, html, json, threading, secrets, time, glob, queue, yt_dlp, requests, importlib.metadata
-from flask import Flask, request, redirect, abort, send_file, jsonify, send_from_directory
+from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TPE2, TALB, TIT2, TRCK, TPOS, TCON, TDRC
+from flask import Flask, request, redirect, abort, send_file, jsonify, url_for
 from urllib.parse import urlparse
 
 app = Flask(__name__)
@@ -31,10 +31,6 @@ JOBS = {}
 app = Flask(__name__)
 
 # ---------------- utils ----------------
-
-@app.get("/favicon.png")
-def favicon():
-    return send_from_directory("icon.png", mimetype="image/png", max_age=86400)
 
 ADMIN_IPS = ["192.168.1.170", "127.0.0.1"]
 
@@ -396,7 +392,7 @@ def page_shell(body_html, title="", footer="Files are processed on server. Alrea
 <meta name="theme-color" content="#0b0b0c">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="format-detection" content="telephone=no,email=no,address=no">
-<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="icon" type="image/png" href="{ url_for('static', filename='favicon.png') }">
 
 <title>{html.escape(title or "DownTil")}</title>
 <style>
