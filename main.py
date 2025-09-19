@@ -683,28 +683,70 @@ def yt_subs(vid):
     fname = sanitize(f"{info.get('title') or 'subtitles'} [{s_lang}]", s_ext or "vtt")
     return send_file(r.raw, mimetype="text/vtt", as_attachment=True, download_name=fname)
 
-def yt_opts(mode):
+def _has_h264_mp4(info, max_h=None):
+    for f in (info.get("formats") or []):
+        if f.get("vcodec", "") and f["vcodec"].startswith("avc1") and (f.get("ext") == "mp4" or f.get("container") == "mp4"):
+            if max_h is None or (f.get("height") or 0) <= max_h:
+                return True
+    return False
+
+def yt_opts(info, mode):
     if mode == "highest":
-        fmt = "bv*+ba/b"
+        want_h = None
+        fmt_strict = "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]/b[vcodec^=avc1][ext=mp4]"
+        fmt_fallback = "bv*+ba/b"
     elif mode == "hd":
-        fmt = "bv*[height<=1080]+ba/b[height<=1080]"
+        want_h = 1080
+        fmt_strict   = "bv*[height<=1080][vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]/b[height<=1080][vcodec^=avc1][ext=mp4]"
+        fmt_fallback = "bv*[height<=1080]+ba/b[height<=1080]"
     elif mode == "audio":
-        fmt = "bestaudio/best"
+        return {
+            "format": "bestaudio/best",
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"},
+                {"key": "FFmpegMetadata"},
+            ],
+        }
     else:
         raise ValueError("bad mode")
 
-    opts = {"format": fmt}
-    if mode == "audio":
-        opts["postprocessors"] = [
-            {"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"0"},
-            {"key":"FFmpegMetadata"}
-        ]
-    else:
-        opts["postprocessors"] = [
-            {"key":"FFmpegVideoRemuxer","preferedformat":"mp4"}
-        ]
-    return opts
+    h264_ok = _has_h264_mp4(info, want_h)
 
+    if h264_ok:
+        return {
+            "format": f"{fmt_strict}",
+            "prefer_ffmpeg": True,
+            "merge_output_format": "mp4",
+            "postprocessors": [
+                {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
+            ],
+            "postprocessor_args": {
+                "ffmpeg": [
+                    "-c:v", "copy",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart",
+                ]
+            },
+        }
+    else:
+        return {
+            "format": f"{fmt_fallback}",
+            "prefer_ffmpeg": True,
+            "merge_output_format": "mp4",
+            "postprocessors": [
+                {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+            ],
+            "postprocessor_args": {
+                "ffmpeg": [
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-profile:v", "high",
+                    "-level", "4.1",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart",
+                ]
+            },
+        }
 
 def job_key(kind, info_id):
     return f"{kind}:{info_id}"
@@ -740,7 +782,7 @@ def yt_start(vid, mode):
     with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
         info = y.extract_info(url, download=False)
     title = f"YouTube - {info.get('title') or 'Video'}"
-    return reuse_or_redirect(f"yt-{mode}", info, title, url, yt_opts(mode), owner=True)
+    return reuse_or_redirect(f"yt-{mode}", info, title, url, yt_opts(info, mode), owner=True)
 
 # ---------- TikTok ----------
 @app.route("/tt")
@@ -792,11 +834,20 @@ def tt_start_video(vid):
     with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
         info = y.extract_info(url, download=False)
     title = f"TikTok - {info.get('title') or info.get('description') or 'Video'}"
-    return reuse_or_redirect("tt-video", info, title, url,
-                             {"format": "bv*+ba/b",
-                              {"key":"FFmpegVideoRemuxer","preferedformat":"mp4"}:None} if False else
-                             {"format":"bv*+ba/b","postprocessors":[{"key":"FFmpegVideoRemuxer","preferedformat":"mp4"}]},
-                             owner=True)
+    return reuse_or_redirect(
+        "tt-video",
+        info,
+        title,
+        url,
+        {
+            "format": "bv*+ba/b",
+            "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
+            "postprocessor_args": {
+                "ffmpeg": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "faststart"]
+            }
+        },
+        owner=True
+    )
 
 # ---------- SoundCloud ----------
 @app.route("/sc")
@@ -931,25 +982,26 @@ def clear_cache_loop():
 def troll_json():
     ip = request.remote_addr
     ua = request.headers.get("User-Agent", "Unknown")
-
+    returnFakeData = False
     print(f"[HONEYPOT HIT] IP={ip}, UA={ua}")
 
-    return jsonify({
-        "status": "success",
-        "country": "Shrek’s Swamp",
-        "countryCode": "OG",
-        "region": "ON",
-        "regionName": "Onions",
-        "city": "Far Far Away",
-        "zip": "69420",
-        "lat": 69.420,
-        "lon": -69.420,
-        "timezone": "Ogre/Donkey",
-        "isp": "Dreamworks Internet",
-        "org": "Big Green Data Centers",
-        "as": "AS420 OGR",
-        "query": ip
-    })
+    if returnFakeData:
+        return jsonify({
+            "status": "success",
+            "country": "Shrek’s Swamp",
+            "countryCode": "OG",
+            "region": "ON",
+            "regionName": "Onions",
+            "city": "Far Far Away",
+            "zip": "69420",
+            "lat": 69.420,
+            "lon": -69.420,
+            "timezone": "Ogre/Donkey",
+            "isp": "Dreamworks Internet",
+            "org": "Big Green Data Centers",
+            "as": "AS420 OGR",
+            "query": ip
+        })
             
 threading.Thread(target=clear_cache_loop, daemon=True).start()
 
