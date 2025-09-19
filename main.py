@@ -992,6 +992,7 @@ def clear_cache_loop():
         except Exception as e:
             app.logger.error(f"Cache clear failed: {e}")
 
+# this is due to when i host, bot scans /json/ to see if its a proxy to abuse or som, idk
 @app.route("/json/")
 def troll_json():
     ip = request.remote_addr
@@ -1010,12 +1011,14 @@ def troll_json():
             "zip": "69420",
             "lat": 69.420,
             "lon": -69.420,
-            "timezone": "Ogre/Donkey",
+            "timezone": "15th-century/Europe",
             "isp": "Dreamworks Internet",
             "org": "Big Green Data Centers",
             "as": "AS420 OGR",
             "query": ip
         })
+    else:
+        abort(403)
             
 threading.Thread(target=clear_cache_loop, daemon=True).start()
 
