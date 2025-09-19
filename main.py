@@ -384,7 +384,7 @@ for _ in range(max(1, MAX_WORKERS)):
 
 # ---------- UI ----------
 
-def page_shell(body_html, title="", footer="Files are processed on server. Already-processed files are cached and reused."):
+def page_shell(body_html, title="", footer="Files are processed on server. Processed files are cached and reused."):
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -393,6 +393,20 @@ def page_shell(body_html, title="", footer="Files are processed on server. Alrea
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="format-detection" content="telephone=no,email=no,address=no">
 <link rel="icon" type="image/png" href="{ url_for('static', filename='favicon.png') }">
+
+<!-- Open Graph / Discord / Facebook -->
+<meta property="og:type" content="website">
+<meta property="og:url" content="{ request.url }">
+<meta property="og:title" content="{ html.escape(title or 'DownTil') }">
+<meta property="og:description" content="Download YouTube, TikTok, and SoundCloud videos & audio. For free, without ads!">
+<meta property="og:image" content="{ url_for('static', filename='favicon.png', _external=True) }">
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary">
+<meta name="twitter:url" content="{ request.url }">
+<meta name="twitter:title" content="{ html.escape(title or 'DownTil') }">
+<meta name="twitter:description" content="Download YouTube, TikTok, and SoundCloud videos & audio. For free, without ads!">
+<meta name="twitter:image" content="{ url_for('static', filename='favicon.png', _external=True) }">
 
 <title>{html.escape(title or "DownTil")}</title>
 <style>
