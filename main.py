@@ -1,7 +1,7 @@
 import os, re, html, json, threading, secrets, time, glob, queue, yt_dlp, requests, importlib.metadata
 from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TPE2, TALB, TIT2, TRCK, TPOS, TCON, TDRC
 from flask import Flask, request, redirect, abort, send_file, jsonify, url_for
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 app = Flask(__name__)
 app.url_map.strict_slashes = False
@@ -49,9 +49,10 @@ def ytdlp_updated() -> bool:
 
     return local == latest, local, latest
 
-@app.route("/server/")
+@app.route("/info/")
 def admin():
-    if not is_local(request.remote_addr):
+    if "a" == "b": # allow all 
+    #if not is_local(request.remote_addr):
         return abort(403)
     else:
         updated, localver, latestver = ytdlp_updated()
@@ -623,7 +624,7 @@ def home():
         </div>
         """
         return page_shell(body, "DownTil")
-    if not re.match(r"^https?://", q, re.I): return redirect_home("home: bad URL in ?q")
+    if not re.match(r"^(https?://|www\.)", q, re.I): return redirect_home("home: bad URL in ?q")
     p = platform_detect(q)
     if p == "yt": return redirect("/yt?url=" + requests.utils.quote(q, safe=""))
     if p == "tt": return redirect("/tt?url=" + requests.utils.quote(q, safe=""))
@@ -799,11 +800,46 @@ def yt_start(vid, mode):
     return reuse_or_redirect(f"yt-{mode}", info, title, url, yt_opts(info, mode), owner=True)
 
 # ---------- TikTok ----------
+def expand_tiktok_short(u: str) -> str:
+    try:
+        if not re.match(r"^https?://", u, re.I):
+            u = "https://" + u.lstrip("/")
+
+        p = urlsplit(u)
+        host = p.netloc.lower().lstrip(".")
+        path = p.path or "/"
+
+        is_short = (
+            (host in ("tiktok.com", "www.tiktok.com") and re.match(r"^/(t|v)/", path))
+            or host.startswith("vm.tiktok.com")
+            or host.startswith("vt.tiktok.com")
+        )
+        if is_short:
+            r = requests.get(u, headers=HEADERS, timeout=10, allow_redirects=True)
+            if r.status_code < 400 and r.url.startswith("http"):
+                return r.url
+    except Exception:
+        pass
+    return u
+
 @app.route("/tt")
 def tt_by_url():
-    url = request.args.get("url","").strip()
-    if not url or not re.match(r"^https?://", url, re.I):
+    url = (request.args.get("url","").strip())
+    if not url or not re.match(r"^(https?://|www\.)", url, re.I):
         return redirect_home("tt: missing or invalid ?url param; redirecting home")
+
+    url = expand_tiktok_short(url)
+    if "/photo/" in url:
+        return page_shell(
+            """
+            <script>
+            alert("DownTil cannot process photos/slideshows.");
+            window.location.href = "/";
+            </script>
+            """,
+            "Unsupported TikTok Type"
+        )
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
             info = y.extract_info(url, download=False)
