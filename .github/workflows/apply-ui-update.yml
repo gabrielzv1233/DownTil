@@ -1,0 +1,27 @@
+name: Apply UI fixes
+on:
+  push:
+    branches: [dev]
+    paths:
+      - scripts/apply_ui_update.py
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: true
+      - name: Apply source changes
+        run: python scripts/apply_ui_update.py
+      - name: Compile modified source
+        run: python -m py_compile main.py
+      - name: Commit requested changes and remove one-time migration
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add main.py tests/test_progress.py
+          git rm scripts/apply_ui_update.py .github/workflows/apply-ui-update.yml
+          git commit -m 'Use HOST and PORT; show inline errors and compact monochrome actions'
+          git push origin HEAD:dev
