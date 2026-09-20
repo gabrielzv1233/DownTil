@@ -14,6 +14,7 @@ h1{margin:0 0 6px;font-size:20px;line-height:1.35;overflow-wrap:anywhere}h2{marg
 .btn{appearance:none;min-width:0;min-height:44px;border:1px solid var(--border);background:linear-gradient(180deg,#1d1d22,#15151a);color:var(--text);padding:10px 12px;border-radius:12px;text-align:center;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font:inherit;line-height:1.3;overflow-wrap:anywhere}
 .btn:hover{border-color:#46465a;background:#22222a}.btn:focus-visible,.search input:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .download-actions{margin-top:18px}.download-actions .btn{border-color:#44405d;background:linear-gradient(180deg,#242136,#1b1b24);font-weight:550}.download-actions .btn:hover{border-color:#8380db;background:#302942}
+.download-actions .btn:last-child:nth-child(odd){grid-column:1/-1}
 .utility-actions{margin-top:9px}.utility-actions .btn{font-size:14px;color:#d9d9e1;background:#19191f}
 .btns.single{grid-template-columns:minmax(0,1fr)}
 .small{font-size:13px;color:var(--muted)}.footer{opacity:.65;font-size:12px;margin:16px 0;text-align:center}
