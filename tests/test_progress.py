@@ -102,5 +102,5 @@ def test_action_layout_and_progress_page(monkeypatch):
     client = main.app.test_client()
     css = client.get('/static/site.css')
     assert css.status_code == 200
-    assert b'grid-template-columns:repeat(2,minmax(0,1fr))' in css.data
+    assert b'grid-template-columns:repeat(4,max-content)' in css.data
     assert client.get('/static/job.js').status_code == 200

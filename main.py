@@ -19,9 +19,14 @@ import requests
 import yt_dlp
 from flask import Flask, abort, jsonify, redirect, request, send_file, url_for
 from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TPE2, TALB, TCON, TDRC, TRCK, TPOS
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 app.url_map.strict_slashes = False
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "80"))
 ROOT = Path(os.getenv('DOWNLOAD_DIR', 'downloads')).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
 COOKIES = Path(os.getenv('COOKIES_FILE', 'cookies.txt')).resolve()
@@ -176,7 +181,26 @@ def user_error(exc):
     if isinstance(exc, requests.RequestException):
         return 'Could not reach the media service. Please try again.'
     if isinstance(exc, yt_dlp.utils.DownloadError):
-        return str(exc).removeprefix('ERROR: ').strip()[:350] or 'The media could not be downloaded.'
+        message = str(exc).lower()
+        if ('tiktok.com' in message and '/photo/' in message) or 'tiktok slideshow' in message:
+            return 'TikTok photo posts and slideshows are not supported. Paste a TikTok video link instead.'
+        if 'unsupported url' in message or 'unsupported site' in message:
+            return 'This link is not supported. Paste a direct YouTube, TikTok video, or SoundCloud track link.'
+        if 'private' in message or 'members only' in message:
+            return 'This media is private or restricted and cannot be downloaded.'
+        if 'sign in' in message or 'login required' in message or 'cookies' in message:
+            return 'This media requires a login. The server may need an updated cookies.txt file.'
+        if 'not available in your country' in message or 'geo-restricted' in message:
+            return 'This media is not available in the server’s region.'
+        if '429' in message or 'rate limit' in message or 'too many requests' in message:
+            return 'The media service is limiting requests. Try again in a little while.'
+        if 'ffmpeg' in message or 'ffprobe' in message:
+            return 'Media processing failed. Check that FFmpeg and ffprobe are installed on the server.'
+        if 'no video formats' in message or 'requested format is not available' in message:
+            return 'No downloadable media was found in the selected quality. Try another quality.'
+        if 'unavailable' in message or 'removed' in message or 'deleted' in message:
+            return 'This media is unavailable or has been removed.'
+        return 'The media service could not process this link. It might be unavailable or temporarily unsupported.'
     if isinstance(exc, ValueError):
         return str(exc)
     return 'Something went wrong on the server. Please try again.'
@@ -308,17 +332,23 @@ def page_shell(body, title='DownTil', footer='Files are processed on the server.
             f'<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
             f'<meta name="theme-color" content="#0b0b0c">'
             f'<link rel="icon" href="{url_for("static", filename="favicon.png")}">'
-            f'<link rel="stylesheet" href="{url_for("static", filename="site.css", v="2")}">'
+            f'<link rel="stylesheet" href="{url_for("static", filename="site.css", v="3")}">'
             f'<title>{esc(title)}</title></head><body><main class="wrap">'
             f'<form class="search" action="/" method="get">'
             f'<input id="qinput" type="url" name="q" aria-label="Media URL" '
             f'placeholder="Paste YouTube / TikTok / SoundCloud URL…" value="{esc(request.args.get("q", ""))}" required>'
-            f'<button class="btn" type="submit">Go</button></form>{body}'
+            f'</form>{body}'
             f'<div class="footer">{esc(footer)}</div></main></body></html>')
 
 
 def error_page(message, status=400):
-    return page_shell(f'<div class="card"><h1>Could not process that link</h1><p class="error" role="alert">{html.escape(message)}</p><a class="btn" href="/">Try another link</a></div>', 'DownTil - Error'), status
+    banner = (f'<div class="error-banner" role="alert">'
+              f'<strong>Could not process that link</strong>'
+              f'<span>{html.escape(message)}</span>'
+              f'<a href="/" aria-label="Dismiss error">Dismiss</a></div>')
+    landing = ('<div class="card"><h1>Paste a link above</h1>'
+               '<h2 class="small">Download from YouTube, TikTok, and SoundCloud.</h2></div>')
+    return page_shell(banner + landing, 'DownTil'), status
 
 
 @app.after_request
@@ -349,9 +379,8 @@ def detail_for(kind, info):
     creator = str(info.get('uploader') or info.get('channel') or info.get('artist') or 'Unknown')
     if kind == 'yt':
         height = max((f.get('height') or 0 for f in info.get('formats') or []), default=0)
-        primary = []
-        if height > 1080:
-            primary.append((f'Highest ({height}p)', url_for('yt_start', vid=item_id, mode='highest')))
+        primary = [(f'Highest ({height}p)' if height else 'Highest quality',
+                    url_for('yt_start', vid=item_id, mode='highest'))]
         primary.append(('HD (≤1080p)', url_for('yt_start', vid=item_id, mode='hd')))
         rates = [f.get('abr') or f.get('tbr') or 0 for f in info.get('formats') or []
                  if f.get('vcodec') in (None, 'none') and f.get('acodec') not in (None, 'none')]
@@ -386,10 +415,13 @@ def detail_for(kind, info):
 def get_detail(url, kind):
     try:
         url, _ = validate_url(url, kind)
+        if kind == 'tt' and '/photo/' in urlsplit(url).path:
+            return error_page('TikTok photo posts and slideshows are not supported. Paste a TikTok video link instead.', 400)
         return detail_for(kind, extract(url))
     except Exception as exc:
         LOG.warning('Metadata lookup failed: %s', exc)
-        return error_page(user_error(exc), 400 if isinstance(exc, ValueError) else 502)
+        unsupported_photo = kind == 'tt' and '/photo/' in str(exc).lower()
+        return error_page(user_error(exc), 400 if isinstance(exc, ValueError) or unsupported_photo else 502)
 
 
 @app.route('/yt')
@@ -627,4 +659,4 @@ def cleanup_loop():
 threading.Thread(target=cleanup_loop, daemon=True, name='downtil-cleanup').start()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '80')), debug=os.getenv('FLASK_DEBUG') == '1', use_reloader=False)
+    app.run(host=HOST, port=PORT, debug=os.getenv('FLASK_DEBUG') == '1', use_reloader=False)
