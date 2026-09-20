@@ -1,1062 +1,533 @@
-import os, re, html, json, threading, secrets, time, glob, queue, yt_dlp, requests, importlib.metadata
-from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TPE2, TALB, TIT2, TRCK, TPOS, TCON, TDRC
-from flask import Flask, request, redirect, abort, send_file, jsonify, url_for
-from urllib.parse import urlparse, urlsplit
+"""DownTil: minimal Flask media downloader."""
+import html
+import importlib.metadata
+import json
+import logging
+import os
+import re
+import secrets
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
+
+import requests
+import yt_dlp
+from flask import Flask, abort, jsonify, redirect, request, send_file, url_for
+from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TPE2, TALB, TCON, TDRC, TRCK, TPOS
 
 app = Flask(__name__)
 app.url_map.strict_slashes = False
-
-# ---------------- config ----------------
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-HEADERS = {"User-Agent": UA, "Accept": "*/*"}
-ILLEGAL = r'[<>:"/\\|?*]'
-DOWNLOAD_DIR = os.path.abspath("./downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-MAX_WORKERS = 4
-
-for fn in os.listdir(DOWNLOAD_DIR):
-    try: os.remove(os.path.join(DOWNLOAD_DIR, fn))
-    except: pass
-
-PENDING_LOCK = threading.Lock()
-ACTIVE_LOCK = threading.Lock()
-JOBS_LOCK = threading.Lock()
-TASKQ = queue.Queue()
-ACTIVE = set()
-JOB_KEYS = {}
-PENDING = []
+ROOT = Path(os.getenv('DOWNLOAD_DIR', 'downloads')).resolve()
+ROOT.mkdir(parents=True, exist_ok=True)
+COOKIES = Path(os.getenv('COOKIES_FILE', 'cookies.txt')).resolve()
+WORKERS = max(1, min(8, int(os.getenv('MAX_WORKERS', str(min(4, os.cpu_count() or 2))))))
+CACHE_HOURS = max(1, int(os.getenv('CACHE_HOURS', '6')))
+POOL = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix='downtil')
+LOCK = threading.RLock()
 JOBS = {}
+KEYS = {}
+METADATA = OrderedDict()
+LOG = logging.getLogger('downtil')
+DOMAINS = {'yt': ('youtube.com', 'youtu.be', 'youtube-nocookie.com', 'youtubegaming.com'), 'tt': ('tiktok.com',), 'sc': ('soundcloud.com',)}
+KINDS = {'yt-highest': ('highest', 'mp4'), 'yt-hd': ('hd', 'mp4'), 'yt-audio': ('mp3', 'mp3'), 'tt-video': ('video', 'mp4'), 'sc-mp3': ('mp3', 'mp3')}
 
-app = Flask(__name__)
 
-# ---------------- utils ----------------
-
-ADMIN_IPS = ["192.168.1.170", "127.0.0.1"]
-
-def is_local(ip):
-    return ip in ADMIN_IPS
-
-def ytdlp_updated() -> bool:
+def validate_url(raw, expected=None):
+    raw = (raw or '').strip()
+    if raw.startswith('www.'):
+        raw = 'https://' + raw
+    if len(raw) > 2048 or any(c.isspace() for c in raw):
+        raise ValueError('Please paste a shorter, valid link.')
     try:
-        local = importlib.metadata.version("yt-dlp")
-    except importlib.metadata.PackageNotFoundError:
-        return False  # not installed
+        p = urlsplit(raw)
+        host = (p.hostname or '').lower().rstrip('.')
+        if p.scheme not in ('http', 'https') or p.username or p.password or p.port:
+            raise ValueError()
+    except ValueError:
+        raise ValueError('Please paste a valid YouTube, TikTok, or SoundCloud link.') from None
+    for kind, domains in DOMAINS.items():
+        if any(host == d or host.endswith('.' + d) for d in domains) and (not expected or expected == kind):
+            return urlunsplit((p.scheme, p.netloc, p.path, p.query, '')), kind
+    raise ValueError('Only YouTube, TikTok, and SoundCloud links are supported.')
 
-    resp = requests.get("https://pypi.org/pypi/yt-dlp/json", timeout=5)
-    resp.raise_for_status()
-    latest = resp.json()["info"]["version"]
 
-    return local == latest, local, latest
+def safe_id(value):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', str(value or '')):
+        abort(400, 'Invalid media ID.')
+    return str(value)
 
-@app.route("/info/")
-def admin():
-    if "a" == "b": # allow all 
-    #if not is_local(request.remote_addr):
-        return abort(403)
-    else:
-        updated, localver, latestver = ytdlp_updated()
-        hmsg = '' if not updated else 'title="YT-DLP is up to date"'
-        return page_shell(
-    f"""
-    <div class="card">
-        <h1>YT-DLP status</h1>
-        {'' if updated else '<h2 style="color:orange;font-size:105%;margin-bottom:6px;", title="Not updating may prevent DownTil from working propperly">Update available!</h2>'}
-            <h2 {hmsg}>Version: {localver}</h2>
-            <h2 {hmsg}>Latest: {latestver}</h2>
-        <br>
-    </div>
-    """, "Server Status", "Stats are not live and only show details from time of page load.")
 
-def sanitize(name: str, ext: str = ""):
-    name = (name or "download").strip()
-    name = re.sub(ILLEGAL, "_", name).rstrip(".")
-    return f"{name}.{ext.lstrip('.')}" if ext else name
+def clean_filename(name, extension=''):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(name or 'download')).strip(' .')[:180] or 'download'
+    return name + ('.' + extension.lstrip('.') if extension else '')
 
-def redirect_home(reason: str):
-    app.logger.warning(reason)
-    return redirect("/")
 
-COOKIES_PATH = os.path.abspath(os.environ.get("COOKIES_FILE", "./cookies.txt"))
-COOKIES_OK = os.path.isfile(COOKIES_PATH)
-if COOKIES_OK:
-    app.logger.info(f"Using cookies file: {COOKIES_PATH}")
-else:
-    app.logger.warning(f"cookies.txt not found at {COOKIES_PATH}; proceeding without cookies")
+def base_opts(extra=None, template=None):
+    opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True, 'paths': {'home': str(ROOT), 'temp': str(ROOT)},
+            'outtmpl': template or str(ROOT / '%(title).180B [%(id)s].%(ext)s'), 'windowsfilenames': True,
+            'retries': 5, 'fragment_retries': 5, 'concurrent_fragment_downloads': 1,
+            'merge_output_format': 'mp4', 'socket_timeout': 20, 'cachedir': False}
+    if COOKIES.is_file():
+        opts['cookiefile'] = str(COOKIES)
+    opts.update(extra or {})
+    return opts
 
-def ydl_opts_base(extra=None, outtmpl=None):
-    base = {
-        "quiet": True,
-        "no_warnings": True,
-        "nocheckcertificate": True,
-        "http_headers": {"User-Agent": UA},
 
-        "paths": {"home": DOWNLOAD_DIR, "temp": DOWNLOAD_DIR},
+def extract(url):
+    with LOCK:
+        cached = METADATA.get(url)
+        if cached and time.monotonic() - cached[0] < 300:
+            METADATA.move_to_end(url)
+            return cached[1]
+    with yt_dlp.YoutubeDL(base_opts()) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not isinstance(info, dict) or info.get('_type') in ('playlist', 'multi_video'):
+        raise ValueError('Please select one video or track, not a playlist.')
+    with LOCK:
+        METADATA[url] = (time.monotonic(), info)
+        METADATA.move_to_end(url)
+        while len(METADATA) > 64:
+            METADATA.popitem(last=False)
+    return info
 
-        "outtmpl": outtmpl or os.path.join(DOWNLOAD_DIR, "%(title).200B [%(id)s].%(ext)s"),
 
-        "merge_output_format": "mp4",
-        "concurrent_fragment_downloads": 1,
-        "fragment_retries": 15,
-        "retries": 10,
-        "continuedl": True,
-        "retry_sleep_functions": {"http": {"interval": 1, "backoff": 2, "max_sleep": 10}},
+def media_url(kind, item_id):
+    item_id = safe_id(item_id)
+    return {'yt': f'https://www.youtube.com/watch?v={item_id}', 'tt': f'https://www.tiktok.com/@_/video/{item_id}',
+            'sc': f'https://api.soundcloud.com/tracks/{item_id}'}[kind]
 
-        "progress_hooks": [lambda d: None],
-        "postprocessor_hooks": [lambda d: None],
-        "postprocessor_args": {"ffmpeg": ["-movflags", "faststart"]},
-        "windowsfilenames": True,
-        "cachedir": False,
-    }
-    if COOKIES_OK:
-        base["cookiefile"] = COOKIES_PATH
-    if extra:
-        base.update(extra)
-    return base
 
-def new_job(kind, title="Preparing…", key=None, display_name=None):
-    jid = secrets.token_hex(8)
-    with JOBS_LOCK:
-        JOBS[jid] = {
-            "id": jid, "kind": kind, "title": title,
-            "stage": "queued", "progress": 0.0, "speed": 0.0,
-            "eta": None, "filename": None, "filepath": None,
-            "display_name": display_name,
-            "error": None, "created": time.time(), "key": key
-        }
-    if key:
-        with JOBS_LOCK:
-            JOB_KEYS[key] = jid
-    return jid
+def existing_file(item_id, tag):
+    suffix = f' [{item_id}] [{tag}]'
+    matches = (p for p in ROOT.iterdir() if p.is_file() and p.stem.endswith(suffix) and p.suffix.lower() in ('.mp3', '.mp4'))
+    return max(matches, key=lambda p: p.stat().st_mtime, default=None)
 
-def set_job(jid, **kw):
-    with JOBS_LOCK:
-        if jid in JOBS: JOBS[jid].update(kw)
 
-def human_bps(bps):
-    try: bps = float(bps or 0)
-    except: bps = 0
-    units = ["B/s","KB/s","MB/s","GB/s"]
-    i = 0
-    while bps >= 1024 and i < len(units)-1:
-        bps /= 1024.0; i += 1
-    return f"{bps:.1f} {units[i]}"
+def thumb(info):
+    images = info.get('thumbnails') or []
+    return info.get('thumbnail') or (max(images, key=lambda t: t.get('height') or 0).get('url') if images else None)
 
-def platform_detect(url):
-    host = urlparse(url).netloc.lower()
-    if any(h in host for h in ("youtube.", "youtu.be", "youtube-nocookie.com", "youtubegaming.com", "music.youtube.com", "m.youtube.com")):
-        return "yt"
-    if "tiktok.com" in host: return "tt"
-    if "soundcloud.com" in host: return "sc"
+
+def subtitles(info):
+    preferred = str(info.get('language') or '').split('-')[0]
+    for tracks in (info.get('subtitles') or {}, info.get('automatic_captions') or {}):
+        if tracks:
+            lang = preferred if preferred in tracks else 'en' if 'en' in tracks else next(iter(tracks))
+            for track in tracks.get(lang) or []:
+                if track.get('url'):
+                    return track['url'], track.get('ext') or 'vtt', lang
     return None
 
-def pick_thumb(info):
-    if info.get("thumbnail"): return info["thumbnail"]
-    ts = info.get("thumbnails") or []
-    if ts:
-        ts = sorted(ts, key=lambda t: t.get("height") or 0)
-        return ts[-1].get("url")
-    return None
 
-def max_height(info):
-    m = 0
-    for f in info.get("formats") or []:
-        h = f.get("height") or 0
-        if h and h > m: m = h
-    return m
+def format_opts(kind, info):
+    if kind in ('yt-audio', 'sc-mp3'):
+        opts = {'format': 'bestaudio/best', 'postprocessors': [
+            {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '0'}, {'key': 'FFmpegMetadata'}]}
+        if kind == 'sc-mp3':
+            opts['writethumbnail'] = True
+            opts['postprocessors'].append({'key': 'EmbedThumbnail'})
+        return opts
+    if kind == 'tt-video':
+        return {'format': 'bv*+ba/b', 'merge_output_format': 'mp4', 'postprocessors': [{'key': 'FFmpegVideoRemuxer', 'preferedformat': 'mp4'}]}
+    cap = '[height<=1080]' if kind == 'yt-hd' else ''
+    compatible = any(str(f.get('vcodec') or '').startswith('avc1') and f.get('ext') == 'mp4' and
+                     (kind != 'yt-hd' or (f.get('height') or 0) <= 1080) for f in info.get('formats') or [])
+    if compatible:
+        return {'format': f'bv*{cap}[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b{cap}[ext=mp4]/bv*{cap}+ba/b', 'merge_output_format': 'mp4'}
+    return {'format': f'bv*{cap}+ba/b{cap}', 'merge_output_format': 'mp4',
+            'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]}
 
-def best_audio_kbps(info):
-    auds = [f for f in (info.get("formats") or []) if f.get("vcodec") in (None,"none") and f.get("acodec") not in (None,"none")]
-    if not auds: return None
-    a = max(auds, key=lambda f: (f.get("abr") or f.get("tbr") or 0))
-    return int(round(a.get("abr") or a.get("tbr") or 0)) or None
 
-def default_sub(info):
-    lang = (info.get("language") or "").split("-")[0] or None
-    subs = info.get("subtitles") or {}
-    autos = info.get("automatic_captions") or {}
-    if lang and lang in subs and subs[lang]:
-        s = subs[lang][0]; return (s.get("url"), s.get("ext") or "vtt", lang)
-    if subs:
-        k = sorted(subs.keys())[0]; s = subs[k][0]; return (s.get("url"), s.get("ext") or "vtt", k)
-    if autos:
-        k = "en" if "en" in autos else sorted(autos.keys())[0]
-        s = autos[k][0]; return (s.get("url"), s.get("ext") or "vtt", k)
-    return (None, None, None)
-
-from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TPE2, TALB, TIT2, TRCK, TPOS, TCON, TDRC, COMM
-
-def is_sc_url_comment(comm_frame: COMM) -> bool:
-    try:
-        t = (comm_frame.text or [""])[0]
-        return ("soundcloud.com/" in t) or t.startswith("https://api.soundcloud.com/") or t.startswith("http://api.soundcloud.com/")
-    except Exception:
-        return False
-
-def valid_genre_value(info, artist_guess):
-    g = (info.get("genre") or "").strip()
-    if not g:
-        return None
-    bads = { (artist_guess or "").replace(" ", "").lower(),
-             (info.get("uploader_id") or "").replace(" ", "").lower(),
-             (info.get("uploader") or "").replace(" ", "").lower() }
-    if g.replace(" ", "").lower() in bads:
-        return None
-    if len(g) > 64:
-        return None
-    return g
-
-def sc_write_id3(mp3_path, info):
+def tag_soundcloud(path, info):
     try:
         try:
-            tags = ID3(mp3_path)
+            tags = ID3(path)
         except ID3NoHeaderError:
             tags = ID3()
-
-        title = info.get("title") or os.path.splitext(os.path.basename(mp3_path))[0]
-        artist = (info.get("artist") or info.get("uploader") or info.get("creator") or info.get("uploader_id") or "Unknown")
-
-        album = (info.get("album") or info.get("playlist_title") or info.get("album_title") or None)
-        if not album:
-            album = f"{title} - Single"
-
-        track_no = info.get("track_number") or info.get("playlist_index") or 1
-        disc_no  = info.get("disc_number") or 1
-
-        date_raw = info.get("release_date") or info.get("upload_date")
-        date_tag = None
-        if isinstance(date_raw, str) and len(date_raw) == 8 and date_raw.isdigit():
-            date_tag = f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
-
-        preserved_comments = []
-        for f in list(tags.getall("COMM")):
-            if not is_sc_url_comment(f):
-                preserved_comments.append(f)
-        tags.delall("COMM")
-        for f in preserved_comments:
-            tags.add(f)
-
-        tags.delall("TIT2"); tags.add(TIT2(encoding=3, text=title))
-        tags.delall("TPE1"); tags.add(TPE1(encoding=3, text=artist))
-        tags.delall("TPE2"); tags.add(TPE2(encoding=3, text=artist))
-        tags.delall("TALB"); tags.add(TALB(encoding=3, text=album))
-
-        tags.delall("TRCK"); tags.add(TRCK(encoding=3, text=str(track_no)))
-        tags.delall("TPOS"); tags.add(TPOS(encoding=3, text=str(disc_no)))
-
-        vg = valid_genre_value(info, artist)
-        tags.delall("TCON")
-        if vg:
-            tags.add(TCON(encoding=3, text=vg))
-
-        if date_tag:
-            tags.delall("TDRC"); tags.add(TDRC(encoding=3, text=date_tag))
-
-        tags.save(mp3_path)
+        title = str(info.get('title') or path.stem)
+        artist = str(info.get('artist') or info.get('uploader') or 'Unknown')
+        fields = {'TIT2': TIT2(encoding=3, text=title), 'TPE1': TPE1(encoding=3, text=artist),
+                  'TPE2': TPE2(encoding=3, text=artist),
+                  'TALB': TALB(encoding=3, text=str(info.get('album') or f'{title} - Single')),
+                  'TRCK': TRCK(encoding=3, text=str(info.get('track_number') or 1)),
+                  'TPOS': TPOS(encoding=3, text=str(info.get('disc_number') or 1))}
+        genre = str(info.get('genre') or '').strip()
+        if genre and len(genre) <= 64 and genre.casefold() != artist.casefold():
+            fields['TCON'] = TCON(encoding=3, text=genre)
+        date = str(info.get('release_date') or info.get('upload_date') or '')
+        if re.fullmatch(r'\d{8}', date):
+            fields['TDRC'] = TDRC(encoding=3, text=f'{date[:4]}-{date[4:6]}-{date[6:]}')
+        for key, frame in fields.items():
+            tags.delall(key)
+            tags.add(frame)
+        tags.save(path)
     except Exception:
-        pass
+        LOG.exception('Could not write SoundCloud tags')
 
-# ---------- file reuse ----------
-def tag_for(kind):
-    return {
-        "yt-highest": "highest",
-        "yt-hd": "hd",
-        "yt-audio": "mp3",
-        "tt-video": "video",
-        "sc-mp3": "mp3",
-    }.get(kind)
 
-def ext_for_kind(kind):
-    return {
-        "yt-highest": "mp4",
-        "yt-hd": "mp4",
-        "yt-audio": "mp3",
-        "tt-video": "mp4",
-        "sc-mp3": "mp3",
-    }.get(kind, "mp4")
+def user_error(exc):
+    if isinstance(exc, requests.Timeout):
+        return 'The media service timed out. Please try again.'
+    if isinstance(exc, requests.RequestException):
+        return 'Could not reach the media service. Please try again.'
+    if isinstance(exc, yt_dlp.utils.DownloadError):
+        return str(exc).removeprefix('ERROR: ').strip()[:350] or 'The media could not be downloaded.'
+    if isinstance(exc, ValueError):
+        return str(exc)
+    return 'Something went wrong on the server. Please try again.'
 
-def find_existing_by_id(vid, tag):
-    pat = os.path.join(DOWNLOAD_DIR, f"*[{vid}]*[{tag}].*")
-    matches = sorted(glob.glob(pat), key=lambda p: os.path.getmtime(p), reverse=True)
-    return matches[0] if matches else None
 
-def outtmpl_with_tag(tag):
-    return os.path.join(DOWNLOAD_DIR, f"%(title).200B [%(id)s] [{tag}].%(ext)s")
+def update_job(jid, **changes):
+    with LOCK:
+        if jid in JOBS:
+            JOBS[jid].update(changes)
 
-# ---------- yt-dlp hooks ----------
-def ydl_progress_hook(d):
-    jid = d.get("__job_id")
-    if not jid: return
-    if d.get("status") == "downloading":
-        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-        downloaded = d.get("downloaded_bytes") or 0
-        prog = (downloaded/total*100.0) if total else 0.0
-        set_job(jid, stage="downloading", progress=prog, speed=d.get("speed") or 0.0, eta=d.get("eta"))
-    elif d.get("status") == "finished":
-        set_job(jid, stage="postprocessing", progress=100.0)
 
-def ydl_post_hook(d):
-    jid = d.get("__job_id")
-    if not jid: return
-    pp = d.get("postprocessor") or "postprocess"
-    if d.get("status") == "started":
-        set_job(jid, stage=f"{pp}…")
-    elif d.get("status") == "finished":
-        set_job(jid, stage=f"{pp} done")
-
-def run_download(jid, url, opts):
+def download(jid, url, info, kind):
+    tag, ext = KINDS[kind]
+    last = 0
+    def progress(data):
+        nonlocal last
+        now = time.monotonic()
+        if data.get('status') == 'downloading' and now - last >= .3:
+            last = now
+            total = data.get('total_bytes') or data.get('total_bytes_estimate') or 0
+            update_job(jid, stage='downloading', progress=round(100 * (data.get('downloaded_bytes') or 0) / total, 1) if total else 0,
+                       speed=data.get('speed') or 0, eta=data.get('eta'))
+        elif data.get('status') == 'finished':
+            update_job(jid, stage='processing', progress=100)
+    update_job(jid, stage='starting')
+    opts = base_opts(format_opts(kind, info), str(ROOT / f'%(title).180B [%(id)s] [{tag}].%(ext)s'))
+    opts['progress_hooks'] = [progress]
     try:
-        opts = dict(opts)
-        def ph(d): d["__job_id"] = jid; ydl_progress_hook(d)
-        def pph(d): d["__job_id"] = jid; ydl_post_hook(d)
-        opts["progress_hooks"] = [ph]
-        opts["postprocessor_hooks"] = [pph]
-        with yt_dlp.YoutubeDL(opts) as y:
-            info = y.extract_info(url, download=True)
-            fpath = info.get("_filename")
-            if not fpath and "requested_downloads" in info and info["requested_downloads"]:
-                fpath = info["requested_downloads"][0].get("filepath")
-            if not fpath:
-                vid = info.get("id")
-                if vid:
-                    k = JOBS.get(jid, {}).get("kind")
-                    t = tag_for(k) if k else None
-                    if t:
-                        p = find_existing_by_id(vid, t)
-                        if p: fpath = p
-                    if not fpath:
-                        for pth in sorted(os.listdir(DOWNLOAD_DIR)):
-                            if f"[{vid}]." in pth: fpath = os.path.join(DOWNLOAD_DIR, pth)
-            if not fpath or not os.path.exists(fpath):
-                raise RuntimeError("Download finished but file missing")
-
-            job = JOBS.get(jid, {})
-            disp = job.get("display_name")
-            if not disp:
-                title = info.get("title") or "download"
-                ext = ext_for_kind(job.get("kind"))
-                disp = sanitize(title, ext)
-
-            kind = job.get("kind") or ""
-            if kind.startswith("sc-") and fpath.lower().endswith(".mp3"):
-                sc_write_id3(fpath, info)
-
-            set_job(jid, stage="ready", progress=100.0, filepath=fpath,
-                    filename=os.path.basename(fpath), display_name=disp)
-    except Exception as e:
-        set_job(jid, stage="error", error=str(e))
-    finally:
-        with ACTIVE_LOCK:
-            ACTIVE.discard(jid)
-
-# ---------- job queue / workers ----------
-
-def queue_position(jid):
-    with PENDING_LOCK:
-        try:
-            return PENDING.index(jid) + 1
-        except ValueError:
-            return 0
-
-def enqueue_job(jid, url, opts):
-    with PENDING_LOCK:
-        PENDING.append(jid)
-    TASKQ.put((jid, url, opts))
-    set_job(jid, stage="queued")
-
-def worker_loop():
-    while True:
-        jid, url, opts = TASKQ.get()
-        while True:
-            with ACTIVE_LOCK:
-                if len(ACTIVE) < MAX_WORKERS:
-                    ACTIVE.add(jid)
-                    break
-            time.sleep(0.2)
-        with PENDING_LOCK:
-            try: PENDING.remove(jid)
-            except ValueError: pass
-        set_job(jid, stage="starting")
-        run_download(jid, url, opts)
-        TASKQ.task_done()
-
-for _ in range(max(1, MAX_WORKERS)):
-    threading.Thread(target=worker_loop, daemon=True).start()
-
-# ---------- UI ----------
-
-def page_shell(body_html, title="", footer="Files are processed on server. Processed files are cached and reused."):
-    return f"""<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0b0b0c">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="format-detection" content="telephone=no,email=no,address=no">
-<link rel="icon" type="image/png" href="{ url_for('static', filename='favicon.png') }">
-
-<!-- Open Graph / Discord / Facebook -->
-<meta property="og:type" content="website">
-<meta property="og:url" content="{ request.url }">
-<meta property="og:title" content="{ html.escape(title or 'DownTil') }">
-<meta property="og:description" content="Download YouTube, TikTok, and SoundCloud videos & audio. For free, without ads!">
-<meta property="og:image" content="{ url_for('static', filename='favicon.png', _external=True) }">
-
-<!-- Twitter -->
-<meta name="twitter:card" content="summary">
-<meta name="twitter:url" content="{ request.url }">
-<meta name="twitter:title" content="{ html.escape(title or 'DownTil') }">
-<meta name="twitter:description" content="Download YouTube, TikTok, and SoundCloud videos & audio. For free, without ads!">
-<meta name="twitter:image" content="{ url_for('static', filename='favicon.png', _external=True) }">
-
-<title>{html.escape(title or "DownTil")}</title>
-<style>
-:root {{
-  --bg:#0b0b0c; --card:#111114; --card2:#17171a; --text:#f5f5f7; --muted:#bdbdc2; --accent:#7d7dfb; --accent2:#9f67ff; --border:#232329;
-}}
-*{{box-sizing:border-box}}
-html, body {{height:100%; margin:0;}}
-body {{
-  display:flex; flex-direction:column; min-height:100%;
-  background:linear-gradient(180deg,#0b0b0c 0,#0e0e12 100%);
-  background-attachment:fixed; background-repeat:no-repeat; background-size:cover;
-  color:var(--text);
-  font-family:-apple-system, BlinkMacSystemFont, 'SF Pro Text', Segoe UI, Roboto, Arial, sans-serif;
-}}
-/* CONTAINER */
-.wrap{{max-width:980px; width:100%; margin:24px auto; padding:0 16px; flex:1 0 auto;}}
-
-/* SEARCH */
-.search{{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:10px 12px;margin-bottom:16px;}}
-.search input{{width:100%;background:transparent;border:0;outline:0;color:var(--text);font-size:1 6px}}
-
-/* CARDS */
-.card{{background:var(--card2);border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 10px 40px #0006}}
-.row{{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}}
-.thumb{{width:320px;max-width:100%;aspect-ratio:16/9;border-radius:14px;border:1px solid var(--border);object-fit:contain;background:#000}}
-.meta{{flex:1;min-width:260px}}
-h1{{margin:0 0 6px;font-size:20px;letter-spacing:.2px}}
-h2{{margin:0;color:var(--muted);font-size:14px;font-weight:500}}
-.btns{{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}}
-.btn{{appearance:none;border:1px solid var(--border);background:linear-gradient(180deg,#1d1d22,#15151a);color:var(--text);padding:10px 14px;border-radius:12px;text-decoration:none;display:inline-flex;gap:8px;align-items:center;justify-content:center}}
-.btn:hover{{border-color:#2e2e35;background:linear-gradient(180deg,#22222a,#18181f)}}
-.small{{font-size:12px;color:var(--muted)}}
-.footer{{opacity:.6;font-size:12px;margin:12px 0 12px;text-align:center}}
-.progress-card{{background:var(--card2);border:1px solid var(--border);border-radius:16px;padding:18px;}}
-.bar-wrap{{height:12px;background:#121217;border:1px solid var(--border);border-radius:999px;overflow:hidden}}
-.bar{{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0%}}
-a.link{{color:#a7b3ff;text-decoration:none}}
-
-/* --- RESPONSIVE --- */
-@media (max-width: 800px) {{
-  .row{{flex-direction:column}}
-  .thumb{{width:100%}}
-  .meta{{min-width:0}}
-}}
-@media (max-width: 560px) {{
-  .btns{{display:grid; grid-template-columns:1fr 1fr; gap:10px}}
-}}
-@media (max-width: 380px) {{
-  .btns{{grid-template-columns:1fr}}
-}}
-/* iOS safe areas */
-@supports (padding: env(safe-area-inset-top)) {{
-  body{{padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}}
-}}
-</style>
-</head><body>
-<div class="wrap">
-  <form class="search" action="/" method="get" id="searchForm">
-    <input id="qinput" type="url" name="q" placeholder="Paste YouTube / TikTok / SoundCloud URL…" value="{html.escape(request.args.get('q') or '')}">
-  </form>
-  {body_html}
-  <div class="footer">{html.escape(footer)}</div>
-</div>
-<script>
-(function(){{
-  const f = document.getElementById('searchForm');
-  const input = document.getElementById('qinput');
-  const isValid = (u) => {{
-    try {{
-      const url = new URL(u);
-      const h = url.hostname.toLowerCase();
-      if (!/^https?:$/.test(url.protocol)) return false;
-      return (h.includes('youtube.') || h==='youtu.be' || h.includes('youtube-nocookie.com') ||
-              h.includes('music.youtube.com') || h.includes('youtubegaming.com') || h.includes('m.youtube.com') ||
-              h.includes('tiktok.com') || h.includes('soundcloud.com'));
-    }} catch {{ return false; }}
-  }};
-  f.addEventListener('submit', (e) => {{
-    const v = (input.value || '').trim();
-    if (!v || !isValid(v)) {{
-      e.preventDefault();
-      alert('Please paste a valid YouTube, TikTok, or SoundCloud link.');
-      return false;
-    }}
-  }});
-}})();
-</script>
-</body></html>"""
-
-def detail_page(info, buttons, media_html=None):
-    title = info.get("title") or "Untitled"
-    creator = info.get("uploader") or info.get("channel") or info.get("artist") or "Unknown"
-    thumb = pick_thumb(info)
-    btn_html = "".join([f'<a class="btn" href="{html.escape(href)}">{html.escape(lbl)}</a>' for lbl, href in buttons])
-    media_block = media_html if media_html is not None else (f'<img class="thumb" src="{html.escape(thumb)}" />' if thumb else '')
-    body = f"""
-    <div class="card">
-      <div class="row">
-        {media_block}
-        <div class="meta">
-          <h1>{html.escape(title)}</h1>
-          <h2>{html.escape(creator)}</h2>
-          <div class="btns">{btn_html}</div>
-        </div>
-      </div>
-    </div>
-    """
-    return page_shell(body, f"{title} - {creator}")
-
-def job_page(jid):
-    j = JOBS.get(jid)
-    if not j: abort(404)
-    title = j.get("title") or "Processing…"
-    own = "1" if (request.args.get("own") == "1") else "0"
-    body = f"""
-    <div class="card">
-      <div class="row" style="align-items:stretch">
-        <div class="meta" style="width:100%">
-          <h1>{html.escape(title)}</h1>
-          <div class="progress-card" style="margin-top:10px">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-              <div class="small"><span id="stage">{html.escape(j.get('stage') or '')}</span></div>
-              <div class="small">Queue: <span id="qpos">{"0"}</span></div>
-            </div>
-            <div class="bar-wrap"><div id="bar" class="bar" style="width:{j.get('progress'):.1f}%"></div></div>
-            <div class="small" style="margin-top:8px">
-              <span id="pct">{j.get('progress'):.1f}%</span> •
-              <span id="speed">{human_bps(j.get('speed'))}</span>
-              <span id="eta"></span>
-            </div>
-            <div id="done" style="margin-top:12px;display:none">
-                <a class="btn" id="download" href="#">Download</a>
-                <a class="btn" href="javascript:history.back()">Back</a>
-            </div>
-            <div id="err" class="small" style="margin-top:10px;color:#ff9a9a;display:none"></div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <script>
-    const jid = {json.dumps(jid)};
-    const redir = new URLSearchParams(location.search).get('redir') === '1';
-    const backUrl = document.referrer || "/";
-    const bar = document.getElementById('bar');
-    const pct = document.getElementById('pct');
-    const stage = document.getElementById('stage');
-    const speed = document.getElementById('speed');
-    const eta = document.getElementById('eta');
-    const qpos = document.getElementById('qpos');
-    const done = document.getElementById('done');
-    const err = document.getElementById('err');
-    const dl = document.getElementById('download');
-
-    function triggerDownloadAndReturn(fileUrl) {{
-      try {{
-        const iframe = document.createElement('iframe');
-        iframe.style.display = 'none';
-        iframe.src = fileUrl;
-        document.body.appendChild(iframe);
-      }} catch (_e) {{}}
-      setTimeout(() => {{ window.location.href = backUrl; }}, redir ? 600 : 1200);
-    }}
-
-    async function handleStatus(j) {{
-      if (j.error) {{ err.style.display='block'; err.textContent=j.error; return true; }}
-      qpos.textContent = j.queue_position || 0;
-      bar.style.width = (j.progress||0).toFixed(1)+'%';
-      pct.textContent = (j.progress||0).toFixed(1)+'%';
-      stage.textContent = j.stage || '';
-      speed.textContent = j.speed_human || '';
-      eta.textContent = (j.eta !== null && j.eta !== undefined) ? (' • ETA ' + Number(j.eta).toFixed(2) + 's') : '';
-      if (j.ready && j.file_url) {{
-        done.style.display='block';
-        dl.href = j.file_url;
-        // Auto-download for ANY visitor, then go back
-        triggerDownloadAndReturn(j.file_url);
-        return true;
-      }}
-      return false;
-    }}
-
-    async function poll(){{
-      try {{
-        const r = await fetch('/job/'+jid+'/status', {{ cache: 'no-store' }});
-        const j = await r.json();
-        const finished = await handleStatus(j);
-        if (!finished) setTimeout(poll, 600);
-      }} catch(e) {{
-        err.style.display='block'; err.textContent='Lost connection.'; 
-      }}
-    }}
-
-    // Kick once immediately (covers the "already completed" case), then poll
-    poll();
-    </script>
-    """
-    return page_shell(body, "Processing…")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            result = ydl.extract_info(url, download=True)
+        file = existing_file(str(info['id']), tag)
+        if file is None:
+            raise RuntimeError('Download completed but no output file was found.')
+        if kind == 'sc-mp3':
+            tag_soundcloud(file, result or info)
+        update_job(jid, stage='ready', progress=100, path=str(file))
+    except Exception as exc:
+        LOG.exception('Download %s failed', jid)
+        update_job(jid, stage='error', error=user_error(exc))
 
 
-# ---------- homepage ----------
-@app.route("/")
+def start_job(kind, info, url):
+    item_id = safe_id(str(info.get('id') or ''))
+    tag, ext = KINDS[kind]
+    key = f'{kind}:{item_id}'
+    with LOCK:
+        previous = KEYS.get(key)
+        if previous and previous in JOBS and JOBS[previous]['path'] and not Path(JOBS[previous]['path']).is_file():
+            JOBS[previous].update(path=None, stage='expired', error='This download has expired. Please start it again.')
+        if previous and previous in JOBS and JOBS[previous]['stage'] not in ('expired', 'error'):
+            return redirect(url_for('job_view', jid=previous, own='0'))
+        file = existing_file(item_id, tag)
+        jid = secrets.token_hex(16)
+        JOBS[jid] = {'id': jid, 'key': key, 'title': str(info.get('title') or 'Download'), 'created': time.time(),
+                     'stage': 'ready' if file else 'queued', 'progress': 100 if file else 0,
+                     'speed': 0, 'eta': None, 'path': str(file) if file else None, 'error': None,
+                     'filename': clean_filename(info.get('title') or 'download', ext)}
+        KEYS[key] = jid
+        if not file:
+            POOL.submit(download, jid, url, info, kind)
+    return redirect(url_for('job_view', jid=jid, own='1'))
+
+
+def page_shell(body, title='DownTil', footer='Files are processed on the server. Finished downloads are cached and reused.'):
+    esc = lambda s: html.escape(str(s), quote=True)
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0b0b0c"><link rel="icon" href="{url_for('static', filename='favicon.png')}"><title>{esc(title)}</title><style>
+:root{{--bg:#0b0b0c;--card:#111114;--card2:#17171a;--text:#f5f5f7;--muted:#bdbdc2;--accent:#7d7dfb;--accent2:#9f67ff;--border:#232329}}
+*{{box-sizing:border-box}}html,body{{height:100%;margin:0}}body{{display:flex;flex-direction:column;min-height:100%;background:linear-gradient(180deg,#0b0b0c,#0e0e12);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif}}
+.wrap{{max-width:980px;width:100%;margin:24px auto;padding:0 16px;flex:1 0 auto}}.search{{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:10px 12px;margin-bottom:16px;display:flex;gap:10px}}.search input{{width:100%;min-width:0;background:transparent;border:0;outline:0;color:var(--text);font-size:16px}}
+.card{{background:var(--card2);border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 10px 40px #0006}}.row{{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}}.thumb{{width:320px;max-width:100%;aspect-ratio:16/9;border-radius:14px;border:1px solid var(--border);object-fit:contain;background:#000}}.meta{{flex:1;min-width:260px}}h1{{margin:0 0 6px;font-size:20px}}h2{{margin:0;color:var(--muted);font-size:14px;font-weight:500;overflow-wrap:anywhere}}
+.btns{{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}}.btn{{appearance:none;border:1px solid var(--border);background:linear-gradient(180deg,#1d1d22,#15151a);color:var(--text);padding:10px 14px;border-radius:12px;text-decoration:none;display:inline-flex;gap:8px;align-items:center;justify-content:center;cursor:pointer;font:inherit}}.btn:hover{{border-color:#46465a;background:#22222a}}.btn:focus-visible,.search input:focus-visible{{outline:2px solid var(--accent);outline-offset:3px}}.small{{font-size:12px;color:var(--muted)}}.footer{{opacity:.6;font-size:12px;margin:12px 0;text-align:center}}.progress-card{{background:var(--card2);border:1px solid var(--border);border-radius:16px;padding:18px}}.bar-wrap{{height:12px;background:#121217;border:1px solid var(--border);border-radius:999px;overflow:hidden}}.bar{{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0%;transition:width .2s}}.error{{color:#ff9a9a;overflow-wrap:anywhere}}
+@media(max-width:800px){{.row{{flex-direction:column}}.thumb{{width:100%}}.meta{{min-width:0;width:100%}}}}@media(max-width:560px){{.btns{{display:grid;grid-template-columns:1fr 1fr}}}}@media(max-width:380px){{.btns{{grid-template-columns:1fr}}}}@media(prefers-reduced-motion:reduce){{.bar{{transition:none}}}}</style></head><body><main class="wrap"><form class="search" action="/" method="get"><input id="qinput" type="url" name="q" aria-label="Media URL" placeholder="Paste YouTube / TikTok / SoundCloud URL…" value="{esc(request.args.get('q', ''))}" required><button class="btn" type="submit">Go</button></form>{body}<div class="footer">{esc(footer)}</div></main></body></html>'''
+
+
+def error_page(message, status=400):
+    return page_shell(f'<div class="card"><h1>Could not process that link</h1><p class="error" role="alert">{html.escape(message)}</p><a class="btn" href="/">Try another link</a></div>', 'DownTil - Error'), status
+
+
+@app.after_request
+def headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    if request.path.startswith('/job/'):
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/')
 def home():
-    q = (request.args.get("q") or "").strip()
-    if not q:
-        body = """
-        <div class="card">
-          <div class="row">
-            <div class="meta">
-              <h1>Paste a link above</h1>
-              <h2 class="small">Download content YouTube, TikTok, and Soundcloud. Processed server-side</h2>
-            </div>
-          </div>
-        </div>
-        """
-        return page_shell(body, "DownTil")
-    if not re.match(r"^(https?://|www\.)", q, re.I): return redirect_home("home: bad URL in ?q")
-    p = platform_detect(q)
-    if p == "yt": return redirect("/yt?url=" + requests.utils.quote(q, safe=""))
-    if p == "tt": return redirect("/tt?url=" + requests.utils.quote(q, safe=""))
-    if p == "sc": return redirect("/sc?url=" + requests.utils.quote(q, safe=""))
-    return redirect_home("home: unsupported URL")
+    query = request.args.get('q', '').strip()
+    if not query:
+        return page_shell('<div class="card"><div class="row"><div class="meta"><h1>Paste a link above</h1><h2 class="small">Download content from YouTube, TikTok, and SoundCloud. Processed server-side.</h2></div></div></div>')
+    try:
+        url, kind = validate_url(query)
+    except ValueError as exc:
+        return error_page(str(exc))
+    return redirect(url_for({'yt': 'yt_by_url', 'tt': 'tt_by_url', 'sc': 'sc_by_url'}[kind], url=url))
 
-# ---------- YouTube ----------
-@app.route("/yt")
+
+def detail_for(kind, info):
+    item_id = safe_id(str(info.get('id') or ''))
+    image = thumb(info)
+    title = str(info.get('title') or 'Untitled')
+    creator = str(info.get('uploader') or info.get('channel') or info.get('artist') or 'Unknown')
+    if kind == 'yt':
+        height = max((f.get('height') or 0 for f in info.get('formats') or []), default=0)
+        buttons = []
+        if height > 1080:
+            buttons.append((f'Highest ({height}p)', url_for('yt_start', vid=item_id, mode='highest')))
+        buttons += [('HD (≤1080p)', url_for('yt_start', vid=item_id, mode='hd')),
+                    ('Audio (best)', url_for('yt_start', vid=item_id, mode='audio'))]
+        sub = subtitles(info)
+        if sub:
+            buttons.append((f'Subtitles ({sub[2].upper()})', url_for('yt_subs', vid=item_id)))
+        if image:
+            buttons.append(('Thumbnail', url_for('yt_thumb', vid=item_id)))
+        media = f'<iframe class="thumb" src="https://www.youtube.com/embed/{quote(item_id)}?rel=0" title="YouTube video player" loading="lazy" allow="picture-in-picture; encrypted-media" allowfullscreen></iframe>'
+    elif kind == 'tt':
+        buttons = [('Download Video', url_for('tt_start_video', vid=item_id))]
+        if image:
+            buttons.append(('Thumbnail', url_for('tt_thumb', vid=item_id)))
+        media = f'<img class="thumb" src="{html.escape(image or "", quote=True)}" loading="lazy" alt="Media cover">' if image else ''
+    else:
+        buttons = [('Download MP3', url_for('sc_start_mp3', sid=item_id))]
+        if image:
+            buttons.append(('Cover', url_for('sc_cover', sid=item_id)))
+        media = f'<img class="thumb" src="{html.escape(image or "", quote=True)}" loading="lazy" alt="Media cover">' if image else ''
+    controls = ''.join(f'<a class="btn" href="{html.escape(href, quote=True)}">{html.escape(label)}</a>' for label, href in buttons)
+    return page_shell(f'<div class="card"><div class="row">{media}<div class="meta"><h1>{html.escape(title)}</h1><h2>{html.escape(creator)}</h2><div class="btns">{controls}</div></div></div></div>', f'{title} - {creator}')
+
+
+def get_detail(url, kind):
+    try:
+        url, _ = validate_url(url, kind)
+        return detail_for(kind, extract(url))
+    except Exception as exc:
+        LOG.warning('Metadata lookup failed: %s', exc)
+        return error_page(user_error(exc), 400 if isinstance(exc, ValueError) else 502)
+
+
+@app.route('/yt')
 def yt_by_url():
-    url = request.args.get("url","").strip()
-    if not url or not re.match(r"^https?://", url, re.I):
-        return redirect_home("yt: missing or invalid ?url")
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-            info = y.extract_info(url, download=False)
-    except Exception as e:
-        return redirect_home(f"yt: extractor failed for {url!r}; {e}")
-    return yt_detail(info)
+    return get_detail(request.args.get('url', ''), 'yt')
 
-@app.route("/yt/<vid>")
+
+@app.route('/yt/<vid>')
 def yt_detail_by_id(vid):
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-            info = y.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-    except Exception as e:
-        return redirect_home(f"yt: invalid video id={vid!r}; {e}")
-    return yt_detail(info)
+    return get_detail(media_url('yt', vid), 'yt')
 
-def yt_detail(info):
-    vid = info.get("id")
-    mh = max_height(info)
-    buttons = []
-    if mh > 1080: buttons.append((f"Highest ({mh}p)", f"/yt/{vid}/start/highest"))
-    buttons.append(("HD (≤1080p)", f"/yt/{vid}/start/hd"))
-    kb = best_audio_kbps(info)
-    buttons.append((f"Audio ({kb} kbps)" if kb else "Audio (best)", f"/yt/{vid}/start/audio"))
-    s_url, s_ext, s_lang = default_sub(info)
-    if s_url: buttons.append((f"Subtitles ({s_lang.upper()})", f"/yt/{vid}/subs"))
-    if pick_thumb(info): buttons.append(("Thumbnail", f"/yt/{vid}/thumb"))
 
-    embed = f'''<iframe class="thumb"
-        src="https://www.youtube.com/embed/{html.escape(vid)}?rel=0"
-        title="YouTube video player" frameborder="0"
-        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-        allowfullscreen loading="lazy" referrerpolicy="origin-when-cross-origin"></iframe>'''
-    return detail_page(info, buttons, media_html=embed)
-
-@app.route("/yt/<vid>/thumb")
-def yt_thumb(vid):
-    with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-        info = y.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-    t = pick_thumb(info)
-    if not t: abort(404)
-    r = requests.get(t, headers=HEADERS, stream=True, timeout=20)
-    if r.status_code >= 400: abort(404)
-    ct = r.headers.get("Content-Type","image/jpeg")
-    ext = "jpg"
-    if "png" in ct: ext="png"
-    if "webp" in ct: ext="webp"
-    fname = sanitize(info.get("title") or "thumbnail", ext)
-    return send_file(r.raw, mimetype=ct, as_attachment=True, download_name=fname)
-
-@app.route("/yt/<vid>/subs")
-def yt_subs(vid):
-    with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-        info = y.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-    s_url, s_ext, s_lang = default_sub(info)
-    if not s_url: abort(404, "No subtitles")
-    r = requests.get(s_url, headers=HEADERS, stream=True, timeout=20)
-    if r.status_code >= 400: abort(404)
-    fname = sanitize(f"{info.get('title') or 'subtitles'} [{s_lang}]", s_ext or "vtt")
-    return send_file(r.raw, mimetype="text/vtt", as_attachment=True, download_name=fname)
-
-def _has_h264_mp4(info, max_h=None):
-    for f in (info.get("formats") or []):
-        if f.get("vcodec", "") and f["vcodec"].startswith("avc1") and (f.get("ext") == "mp4" or f.get("container") == "mp4"):
-            if max_h is None or (f.get("height") or 0) <= max_h:
-                return True
-    return False
-
-def yt_opts(info, mode):
-    if mode == "highest":
-        want_h = None
-        fmt_strict = "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]/b[vcodec^=avc1][ext=mp4]"
-        fmt_fallback = "bv*+ba/b"
-    elif mode == "hd":
-        want_h = 1080
-        fmt_strict   = "bv*[height<=1080][vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]/b[height<=1080][vcodec^=avc1][ext=mp4]"
-        fmt_fallback = "bv*[height<=1080]+ba/b[height<=1080]"
-    elif mode == "audio":
-        return {
-            "format": "bestaudio/best",
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"},
-                {"key": "FFmpegMetadata"},
-            ],
-        }
-    else:
-        raise ValueError("bad mode")
-
-    h264_ok = _has_h264_mp4(info, want_h)
-
-    if h264_ok:
-        return {
-            "format": f"{fmt_strict}",
-            "prefer_ffmpeg": True,
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
-            ],
-            "postprocessor_args": {
-                "ffmpeg": [
-                    "-c:v", "copy",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-movflags", "+faststart",
-                ]
-            },
-        }
-    else:
-        return {
-            "format": f"{fmt_fallback}",
-            "prefer_ffmpeg": True,
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
-            ],
-            "postprocessor_args": {
-                "ffmpeg": [
-                    "-c:v", "libx264",
-                    "-pix_fmt", "yuv420p",
-                    "-profile:v", "high",
-                    "-level", "4.1",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-movflags", "+faststart",
-                ]
-            },
-        }
-
-def job_key(kind, info_id):
-    return f"{kind}:{info_id}"
-
-def reuse_or_redirect(kind, info, title, url, opts, owner=True):
-    vid = info.get("id")
-    tag = tag_for(kind)
-    disp = sanitize(info.get("title") or "download", ext_for_kind(kind))
-
-    if tag:
-        existing = find_existing_by_id(vid, tag)
-        if existing:
-            jid = new_job(kind, title=title, key=job_key(kind, vid), display_name=disp)
-            set_job(jid, stage="ready", progress=100.0, filepath=existing,
-                    filename=os.path.basename(existing))
-            return redirect(f"/job/{jid}?own=1&redir=1")
-
-    key = job_key(kind, vid)
-    with JOBS_LOCK:
-        other = JOB_KEYS.get(key)
-        if other and other in JOBS and not JOBS[other].get("error"):
-            return redirect(f"/job/{other}?own=0")
-
-    outtmpl = outtmpl_with_tag(tag) if tag else None
-    dl_opts = ydl_opts_base(opts, outtmpl=outtmpl)
-    jid = new_job(kind, title=title, key=key, display_name=disp)
-    enqueue_job(jid, url, dl_opts)
-    return redirect(f"/job/{jid}?own={'1' if owner else '0'}")
-
-@app.route("/yt/<vid>/start/<mode>")
-def yt_start(vid, mode):
-    url = f"https://www.youtube.com/watch?v={vid}"
-    with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-        info = y.extract_info(url, download=False)
-    title = f"YouTube - {info.get('title') or 'Video'}"
-    return reuse_or_redirect(f"yt-{mode}", info, title, url, yt_opts(info, mode), owner=True)
-
-# ---------- TikTok ----------
-def expand_tiktok_short(u: str) -> str:
-    try:
-        if not re.match(r"^https?://", u, re.I):
-            u = "https://" + u.lstrip("/")
-
-        p = urlsplit(u)
-        host = p.netloc.lower().lstrip(".")
-        path = p.path or "/"
-
-        is_short = (
-            (host in ("tiktok.com", "www.tiktok.com") and re.match(r"^/(t|v)/", path))
-            or host.startswith("vm.tiktok.com")
-            or host.startswith("vt.tiktok.com")
-        )
-        if is_short:
-            r = requests.get(u, headers=HEADERS, timeout=10, allow_redirects=True)
-            if r.status_code < 400 and r.url.startswith("http"):
-                return r.url
-    except Exception:
-        pass
-    return u
-
-@app.route("/tt")
+@app.route('/tt')
 def tt_by_url():
-    url = (request.args.get("url","").strip())
-    if not url or not re.match(r"^(https?://|www\.)", url, re.I):
-        return redirect_home("tt: missing or invalid ?url param; redirecting home")
+    return get_detail(request.args.get('url', ''), 'tt')
 
-    url = expand_tiktok_short(url)
-    if "/photo/" in url:
-        return page_shell(
-            """
-            <script>
-            alert("DownTil cannot process photos/slideshows.");
-            window.location.href = "/";
-            </script>
-            """,
-            "Unsupported TikTok Type"
-        )
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-            info = y.extract_info(url, download=False)
-    except Exception as e:
-        return redirect_home(f"tt: extractor failed for url={url!r}; {e}")
-    return tt_detail(info)
-
-@app.route("/tt/<anyid>")
+@app.route('/tt/<anyid>')
 def tt_by_id(anyid):
-    url = f"https://www.tiktok.com/@_/video/{anyid}"
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-            info = y.extract_info(url, download=False)
-    except Exception as e:
-        return redirect_home(f"tt: invalid id={anyid!r}; {e}")
-    return tt_detail(info)
+    return get_detail(media_url('tt', anyid), 'tt')
 
-def tt_detail(info):
-    vid = info.get("id")
-    buttons = [("Download Video", f"/tt/{vid}/start/video")]
-    if pick_thumb(info): buttons.append(("Thumbnail", f"/tt/{vid}/thumb"))
-    return detail_page(info, buttons)
 
-@app.route("/tt/<vid>/thumb")
-def tt_thumb(vid):
-    with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-        info = y.extract_info(f"https://www.tiktok.com/@_/video/{vid}", download=False)
-    t = pick_thumb(info)
-    if not t: abort(404)
-    r = requests.get(t, headers=HEADERS, stream=True, timeout=20)
-    if r.status_code >= 400: abort(404)
-    ct = r.headers.get("Content-Type","image/jpeg")
-    ext = "jpg"
-    if "png" in ct: ext="png"
-    if "webp" in ct: ext="webp"
-    fname = sanitize(info.get("title") or info.get("description") or "tiktok", ext)
-    return send_file(r.raw, mimetype=ct, as_attachment=True, download_name=fname)
-
-@app.route("/tt/<vid>/start/video")
-def tt_start_video(vid):
-    url = f"https://www.tiktok.com/@_/video/{vid}"
-    with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-        info = y.extract_info(url, download=False)
-    title = f"TikTok - {info.get('title') or info.get('description') or 'Video'}"
-    return reuse_or_redirect(
-        "tt-video",
-        info,
-        title,
-        url,
-        {
-            "format": "bv*+ba/b",
-            "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
-            "postprocessor_args": {
-                "ffmpeg": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "faststart"]
-            }
-        },
-        owner=True
-    )
-
-# ---------- SoundCloud ----------
-@app.route("/sc")
+@app.route('/sc')
 def sc_by_url():
-    url = request.args.get("url","").strip()
-    if not url or not re.match(r"^https?://", url, re.I):
-        return redirect_home("sc: missing or invalid ?url param; redirecting home")
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-            info = y.extract_info(url, download=False)
-    except Exception as e:
-        return redirect_home(f"sc: extractor failed for url={url!r}; {e}")
-    return sc_detail(info)
+    return get_detail(request.args.get('url', ''), 'sc')
 
-@app.route("/sc/<user>/<track>")
+
+@app.route('/sc/<user>/<track>')
 def sc_detail_route(user, track):
-    url = f"https://soundcloud.com/{user}/{track}"
-    with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-        info = y.extract_info(url, download=False)
-    return sc_detail(info)
+    return get_detail(f'https://soundcloud.com/{quote(user, safe="")}/{quote(track, safe="")}', 'sc')
 
-def sc_detail(info):
-    buttons = [("Download MP3", f"/sc/{info.get('id')}/start/mp3")]
-    if pick_thumb(info): buttons.append(("Cover", f"/sc/{info.get('id')}/cover"))
-    return detail_page(info, buttons)
 
-@app.route("/sc/<sid>/cover")
-def sc_cover(sid):
-    with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-        info = y.extract_info(f"https://api.soundcloud.com/tracks/{sid}", download=False)
-    t = pick_thumb(info)
-    if not t: abort(404)
-    r = requests.get(t, headers=HEADERS, stream=True, timeout=20)
-    if r.status_code >= 400: abort(404)
-    ct = r.headers.get("Content-Type","image/jpeg")
-    ext = "jpg"
-    if "png" in ct: ext="png"
-    if "webp" in ct: ext="webp"
-    fname = sanitize(f"{info.get('uploader') or 'Artist'} - {info.get('title') or 'cover'}", ext)
-    return send_file(r.raw, mimetype=ct, as_attachment=True, download_name=fname)
-
-@app.route("/sc/<sid>/start/mp3")
-def sc_start_mp3(sid):
-    url = f"https://api.soundcloud.com/tracks/{sid}"
-    with yt_dlp.YoutubeDL(ydl_opts_base()) as y:
-        info = y.extract_info(url, download=False)
-    title = f"SoundCloud - {info.get('title') or 'Track'}"
-    return reuse_or_redirect("sc-mp3", info, title, url, {
-        "format": "bestaudio/best",
-        "addmetadata": True, "writethumbnail": True,
-        "postprocessors": [
-            {"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"0"},
-            {"key":"FFmpegMetadata"},
-            {"key":"EmbedThumbnail"},
-        ]
-    }, owner=True)
-
-# ---------- Jobs ----------
-@app.route("/job/<jid>")
-def job_view(jid):
-    return job_page(jid)
-
-@app.route("/job/<jid>/status")
-def job_status(jid):
-    j = JOBS.get(jid)
-    if not j: return jsonify({"error":"unknown job"}), 404
-    eta_val = j.get("eta")
+def begin(kind, url):
     try:
-        eta_val = round(float(eta_val), 2) if eta_val is not None else None
-    except Exception:
-        eta_val = None
-    return jsonify({
-        "id": j["id"],
-        "stage": j["stage"],
-        "progress": j["progress"],
-        "speed": j["speed"],
-        "speed_human": human_bps(j["speed"]),
-        "eta": eta_val,
-        "queue_position": queue_position(jid),
-        "ready": (j.get("filepath") is not None and j.get("error") is None),
-        "file_url": (f"/job/{jid}/file" if j.get("filepath") else None),
-        "error": j.get("error"),
-    })
-    
-@app.route("/job/<jid>/file")
-def job_file(jid):
-    j = JOBS.get(jid)
-    if not j or not j.get("filepath") or not os.path.exists(j["filepath"]):
+        return start_job(kind, extract(url), url)
+    except Exception as exc:
+        LOG.warning('Could not start download: %s', exc)
+        return error_page(user_error(exc), 400 if isinstance(exc, ValueError) else 502)
+
+
+@app.route('/yt/<vid>/start/<mode>')
+def yt_start(vid, mode):
+    if mode not in ('highest', 'hd', 'audio'):
         abort(404)
-    disp = j.get("display_name")
-    if not disp:
-        title_guess = (j.get("title") or "download").split(" - ", 1)[-1]
-        ext = os.path.splitext(j["filepath"])[1].lstrip(".") or "bin"
-        disp = sanitize(title_guess, ext)
-    return send_file(j["filepath"], as_attachment=True, download_name=disp)
+    return begin('yt-' + mode, media_url('yt', vid))
 
-CACHE_CLEAR_INTERVAL_HOURS = 6  
 
-def clear_cache_loop():
-    while True:
-        time.sleep(CACHE_CLEAR_INTERVAL_HOURS * 3600)
+@app.route('/tt/<vid>/start/video')
+def tt_start_video(vid):
+    return begin('tt-video', media_url('tt', vid))
+
+
+@app.route('/sc/<sid>/start/mp3')
+def sc_start_mp3(sid):
+    return begin('sc-mp3', media_url('sc', sid))
+
+
+def attachment(kind, item_id, is_sub=False):
+    try:
+        info = extract(media_url(kind, item_id))
+        if is_sub:
+            sub = subtitles(info)
+            if not sub:
+                return error_page('No subtitles are available.', 404)
+            url, ext, lang = sub
+            name = f'{info.get("title") or "subtitles"} [{lang}]'
+        else:
+            url = thumb(info)
+            if not url:
+                return error_page('No cover image is available.', 404)
+            ext = Path(urlsplit(url).path).suffix.lower().lstrip('.')
+            if ext not in ('png', 'jpg', 'jpeg', 'webp'):
+                ext = 'jpg'
+            name = info.get('title') or 'thumbnail'
+        if urlsplit(url).scheme != 'https':
+            raise ValueError('Attachment URL must use HTTPS.')
+        with requests.get(url, timeout=(5, 20), stream=True) as response:
+            response.raise_for_status()
+            data = BytesIO()
+            for chunk in response.iter_content(65536):
+                if data.tell() + len(chunk) > 16 * 1024 * 1024:
+                    raise ValueError('Attachment is too large.')
+                data.write(chunk)
+            data.seek(0)
+        mime = 'text/vtt' if is_sub else 'image/' + ('jpeg' if ext in ('jpg', 'jpeg') else ext)
+        return send_file(data, mimetype=mime, as_attachment=True, download_name=clean_filename(name, ext))
+    except Exception as exc:
+        LOG.warning('Attachment error: %s', exc)
+        return error_page(user_error(exc), 502)
+
+
+@app.route('/yt/<vid>/thumb')
+def yt_thumb(vid):
+    return attachment('yt', vid)
+
+
+@app.route('/yt/<vid>/subs')
+def yt_subs(vid):
+    return attachment('yt', vid, True)
+
+
+@app.route('/tt/<vid>/thumb')
+def tt_thumb(vid):
+    return attachment('tt', vid)
+
+
+@app.route('/sc/<sid>/cover')
+def sc_cover(sid):
+    return attachment('sc', sid)
+
+
+def job_snapshot(jid):
+    with LOCK:
+        job = JOBS.get(jid)
+        if not job:
+            return None
+        result = job.copy()
+        result['queue_position'] = sum(1 for j in JOBS.values() if j['stage'] == 'queued' and j['created'] < job['created']) + 1 if job['stage'] == 'queued' else 0
+    if result['path'] and not Path(result['path']).is_file():
+        update_job(jid, path=None, stage='expired', error='This download has expired. Please start it again.')
+        result.update(path=None, stage='expired', error='This download has expired. Please start it again.')
+    return result
+
+
+@app.route('/job/<jid>')
+def job_view(jid):
+    job = job_snapshot(jid)
+    if not job:
+        abort(404)
+    progress = float(job['progress'] or 0)
+    body = f'''<div class="card"><h1>{html.escape(job['title'])}</h1><div class="progress-card"><div style="display:flex;justify-content:space-between"><span class="small" id="stage" role="status" aria-live="polite">{html.escape(job['stage'])}</span><span class="small">Queue: <span id="qpos">{job['queue_position']}</span></span></div><div class="bar-wrap" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{progress}" id="progressWrap"><div class="bar" id="bar" style="width:{progress}%"></div></div><p class="small"><span id="pct">{progress:.1f}%</span> · <span id="speed">0 B/s</span><span id="eta"></span></p><div id="done" class="btns" style="display:none"><a class="btn" id="download" href="#">Download</a><a class="btn" href="/">New download</a></div><p id="err" class="error" role="alert" style="display:none"></p></div></div>
+<script>(()=>{{const jid={json.dumps(jid)},auto={str(request.args.get('own') == '1').lower()};const $=id=>document.getElementById(id);let failures=0,started=false;const fmt=v=>{{let n=v||0,i=0;while(n>=1024&&i<3){{n/=1024;i++}}return n.toFixed(1)+' '+['B/s','KB/s','MB/s','GB/s'][i]}};async function poll(){{if(document.hidden){{setTimeout(poll,2000);return}}try{{const r=await fetch('/job/'+jid+'/status',{{cache:'no-store'}});if(!r.ok)throw Error();const j=await r.json();failures=0;$('err').style.display='none';$('stage').textContent=j.stage;$('qpos').textContent=j.queue_position;$('bar').style.width=j.progress+'%';$('progressWrap').setAttribute('aria-valuenow',j.progress);$('pct').textContent=j.progress.toFixed(1)+'%';$('speed').textContent=fmt(j.speed);$('eta').textContent=j.eta==null?'':' · ETA '+Math.round(j.eta)+'s';if(j.error){{$('err').textContent=j.error;$('err').style.display='block';return}}if(j.ready&&j.file_url){{$('done').style.display='flex';$('download').href=j.file_url;if(auto&&!started){{started=true;const a=document.createElement('a');a.href=j.file_url;a.download='';document.body.append(a);a.click();a.remove()}}return}}setTimeout(poll,1200)}}catch(e){{failures++;$('err').style.display='block';$('err').textContent='Connection interrupted. Retrying…';setTimeout(poll,Math.min(10000,1000*2**Math.min(failures,4)))}}}}poll()}})();</script>'''
+    return page_shell(body, 'Processing…')
+
+
+@app.route('/job/<jid>/status')
+def job_status(jid):
+    job = job_snapshot(jid)
+    if not job:
+        return jsonify(error='Unknown job'), 404
+    return jsonify(id=jid, stage=job['stage'], progress=round(float(job['progress'] or 0), 1), speed=job['speed'] or 0,
+                   eta=job['eta'], queue_position=job['queue_position'], ready=bool(job['path']),
+                   file_url=url_for('job_file', jid=jid) if job['path'] else None, error=job['error'])
+
+
+@app.route('/job/<jid>/file')
+def job_file(jid):
+    job = job_snapshot(jid)
+    if not job or not job['path']:
+        abort(404)
+    path = Path(job['path']).resolve()
+    if not path.is_relative_to(ROOT) or not path.is_file():
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=job['filename'], conditional=True)
+
+
+@app.route('/info/')
+def admin():
+    try:
+        local = importlib.metadata.version('yt-dlp')
+    except importlib.metadata.PackageNotFoundError:
+        local = 'not installed'
+    try:
+        response = requests.get('https://pypi.org/pypi/yt-dlp/json', timeout=(3, 5))
+        response.raise_for_status()
+        latest = response.json()['info']['version']
+        status = 'Up to date' if latest == local else 'Update available'
+    except (requests.RequestException, KeyError, ValueError):
+        latest, status = 'Unavailable', 'Could not check for updates'
+    return page_shell(f'<div class="card"><h1>YT-DLP status</h1><h2>{html.escape(status)}</h2><p>Installed: {html.escape(local)}<br>Latest: {html.escape(latest)}</p></div>', 'Server Status')
+
+
+@app.route('/json/')
+def block_json_probe():
+    abort(403)
+
+
+def clean_expired(now=None):
+    now = now or time.time()
+    cutoff = now - CACHE_HOURS * 3600
+    with LOCK:
+        active = {j['key'] for j in JOBS.values() if j['stage'] in ('queued', 'starting', 'downloading', 'processing')}
+    removed = 0
+    for path in ROOT.iterdir():
+        if not path.is_file() or path.is_symlink() or path.suffix.lower() not in ('.mp3', '.mp4') or path.stat().st_mtime >= cutoff:
+            continue
+        if any(f' [{key.split(":", 1)[1]}] [{KINDS[key.split(":", 1)[0]][0]}]' in path.stem for key in active if key.split(':', 1)[0] in KINDS):
+            continue
         try:
-            removed = 0
-            for fn in os.listdir(DOWNLOAD_DIR):
-                try:
-                    os.remove(os.path.join(DOWNLOAD_DIR, fn))
-                    removed += 1
-                except:
-                    pass
+            path.unlink()
+            removed += 1
+        except OSError:
+            LOG.exception('Could not expire %s', path.name)
+    with LOCK:
+        for jid, job in list(JOBS.items()):
+            if job['path'] and not Path(job['path']).exists():
+                job.update(path=None, stage='expired', error='This download has expired. Please start it again.')
+            if job['created'] < now - 86400 and job['stage'] in ('ready', 'expired', 'error'):
+                JOBS.pop(jid)
+                if KEYS.get(job['key']) == jid:
+                    KEYS.pop(job['key'], None)
+    return removed
 
-            removed_refs = 0
-            with JOBS_LOCK:
-                for jid, j in list(JOBS.items()):
-                    fp = j.get("filepath")
-                    if not fp:
-                        continue
-                    if not os.path.exists(fp):
-                        j["filepath"] = None
-                        j["stage"] = "expired"
-                        j["error"] = "File removed from cache"
-                        k = j.get("key")
-                        if k and JOB_KEYS.get(k) == jid:
-                            JOB_KEYS.pop(k, None)
-                        removed_refs += 1
-            if removed_refs:
-                app.logger.info(f"Pruned {removed_refs} job file references (expired cache).")
-            app.logger.info(f"Cache cleared: {removed} files removed from {DOWNLOAD_DIR}")
-        except Exception as e:
-            app.logger.error(f"Cache clear failed: {e}")
 
-# this is due to when i host, bot scans /json/ to see if its a proxy to abuse or som, idk
-@app.route("/json/")
-def troll_json():
-    ip = request.remote_addr
-    ua = request.headers.get("User-Agent", "Unknown")
-    returnFakeData = False
-    print(f"[HONEYPOT HIT] IP={ip}, UA={ua}")
+def cleanup_loop():
+    while True:
+        time.sleep(3600)
+        try:
+            clean_expired()
+        except Exception:
+            LOG.exception('Cache cleanup failed')
 
-    if returnFakeData:
-        return jsonify({
-            "status": "success",
-            "country": "Shrek’s Swamp",
-            "countryCode": "OG",
-            "region": "ON",
-            "regionName": "Onions",
-            "city": "Far Far Away",
-            "zip": "69420",
-            "lat": 69.420,
-            "lon": -69.420,
-            "timezone": "15th-century/Europe",
-            "isp": "Dreamworks Internet",
-            "org": "Big Green Data Centers",
-            "as": "AS420 OGR",
-            "query": ip
-        })
-    else:
-        abort(403)
-            
-threading.Thread(target=clear_cache_loop, daemon=True).start()
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=80, debug=False, use_reloader=True)
+threading.Thread(target=cleanup_loop, daemon=True, name='downtil-cleanup').start()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '80')), debug=os.getenv('FLASK_DEBUG') == '1', use_reloader=False)
