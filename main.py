@@ -1,8 +1,9 @@
-"""DownTil: minimal Flask media downloader."""
+"""DownTil: lightweight Flask media downloader."""
 import html
 import importlib.metadata
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -188,33 +189,94 @@ def update_job(jid, **changes):
 
 
 def download(jid, url, info, kind):
-    tag, ext = KINDS[kind]
-    last = 0
+    """Report ONLY the current transfer's known progress, never an invented whole-job ETA.
+
+    yt-dlp calls its download hook separately for video and audio streams. A
+    finished stream is not a finished job; merging, tagging and conversion may
+    take an unknown amount of time. Only the verified final file means 100%.
+    """
+    tag, _ = KINDS[kind]
+    last = 0.0
+    last_file = None
+
     def progress(data):
-        nonlocal last
+        nonlocal last, last_file
+        state = data.get('status')
+        if state == 'finished':
+            last = 0.0
+            update_job(jid, stage='processing', detail='File downloaded; preparing the next step…',
+                       progress=None, progress_scope='Preparing output', speed=0, eta=None, estimated=False)
+            return
+        if state != 'downloading':
+            return
+        filename = data.get('filename') or data.get('tmpfilename')
+        current_file = str(filename) if filename else None
         now = time.monotonic()
-        if data.get('status') == 'downloading' and now - last >= .3:
-            last = now
-            total = data.get('total_bytes') or data.get('total_bytes_estimate') or 0
-            update_job(jid, stage='downloading', progress=round(100 * (data.get('downloaded_bytes') or 0) / total, 1) if total else 0,
-                       speed=data.get('speed') or 0, eta=data.get('eta'))
+        if current_file == last_file and now - last < .3:
+            return
+        last, last_file = now, current_file
+        total_exact = data.get('total_bytes')
+        total_guess = data.get('total_bytes_estimate')
+        total = total_exact or total_guess
+        downloaded = data.get('downloaded_bytes') or 0
+        raw_speed = data.get('speed') or 0
+        try:
+            total = float(total) if total is not None else 0.0
+            downloaded = float(downloaded)
+            speed = float(raw_speed)
+            if not math.isfinite(total) or total <= 0:
+                total = 0.0
+            if not math.isfinite(downloaded) or downloaded < 0:
+                downloaded = 0.0
+            if not math.isfinite(speed) or speed <= 0:
+                speed = 0.0
+        except (TypeError, ValueError, OverflowError):
+            total, downloaded, speed = 0.0, 0.0, 0.0
+        percent = round(min(100.0, 100 * downloaded / total), 1) if total else None
+        # ETA covers only the active file, not a second stream or FFmpeg work.
+        remaining = max(0.0, total - downloaded) if total else 0.0
+        eta = round(remaining / speed, 1) if total and speed else None
+        guessed = not bool(total_exact)
+        update_job(jid, stage='downloading', detail='Downloading current file…', progress=percent,
+                   progress_scope='Approx. current file' if guessed and total else 'Current file',
+                   speed=speed, eta=eta, estimated=True)
+
+    def postprocess(data):
+        if data.get('status') == 'started':
+            name = str(data.get('postprocessor') or '')
+            description = ('Converting audio…' if 'ExtractAudio' in name else
+                           'Merging or converting media…' if 'FFmpeg' in name else
+                           'Embedding artwork…' if 'Thumbnail' in name else 'Finishing output…')
+            update_job(jid, stage='processing', detail=description, progress=None,
+                       progress_scope='Processing', speed=0, eta=None, estimated=False)
         elif data.get('status') == 'finished':
-            update_job(jid, stage='processing', progress=100)
-    update_job(jid, stage='starting')
+            update_job(jid, stage='processing', detail='Finishing output…', progress=None,
+                       progress_scope='Processing', speed=0, eta=None, estimated=False)
+
+    update_job(jid, stage='starting', detail='Connecting to the media service…', progress=None,
+               progress_scope='Waiting', speed=0, eta=None, estimated=False)
     opts = base_opts(format_opts(kind, info), str(ROOT / f'%(title).180B [%(id)s] [{tag}].%(ext)s'))
     opts['progress_hooks'] = [progress]
+    opts['postprocessor_hooks'] = [postprocess]
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             result = ydl.extract_info(url, download=True)
         file = existing_file(str(info['id']), tag)
         if file is None:
             raise RuntimeError('Download completed but no output file was found.')
+        update_job(jid, stage='processing', detail='Finishing metadata…', progress=None,
+                   progress_scope='Processing', speed=0, eta=None, estimated=False)
         if kind == 'sc-mp3':
             tag_soundcloud(file, result or info)
-        update_job(jid, stage='ready', progress=100, path=str(file))
+        # 100% means that the final file really exists and any metadata work ended.
+        if not file.is_file():
+            raise RuntimeError('Final file disappeared before it could be served.')
+        update_job(jid, stage='ready', detail='Ready to download', progress=100.0,
+                   progress_scope='Complete', speed=0, eta=None, estimated=False, path=str(file))
     except Exception as exc:
         LOG.exception('Download %s failed', jid)
-        update_job(jid, stage='error', error=user_error(exc))
+        update_job(jid, stage='error', detail='Download failed', progress=None,
+                   progress_scope='Unavailable', speed=0, eta=None, estimated=False, error=user_error(exc))
 
 
 def start_job(kind, info, url):
@@ -230,8 +292,9 @@ def start_job(kind, info, url):
         file = existing_file(item_id, tag)
         jid = secrets.token_hex(16)
         JOBS[jid] = {'id': jid, 'key': key, 'title': str(info.get('title') or 'Download'), 'created': time.time(),
-                     'stage': 'ready' if file else 'queued', 'progress': 100 if file else 0,
-                     'speed': 0, 'eta': None, 'path': str(file) if file else None, 'error': None,
+                     'stage': 'ready' if file else 'queued', 'detail': 'Ready to download' if file else 'Waiting for a worker…',
+                     'progress': 100.0 if file else None, 'progress_scope': 'Complete' if file else 'Waiting',
+                     'speed': 0, 'eta': None, 'estimated': False, 'path': str(file) if file else None, 'error': None,
                      'filename': clean_filename(info.get('title') or 'download', ext)}
         KEYS[key] = jid
         if not file:
@@ -240,14 +303,18 @@ def start_job(kind, info, url):
 
 
 def page_shell(body, title='DownTil', footer='Files are processed on the server. Finished downloads are cached and reused.'):
-    esc = lambda s: html.escape(str(s), quote=True)
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0b0b0c"><link rel="icon" href="{url_for('static', filename='favicon.png')}"><title>{esc(title)}</title><style>
-:root{{--bg:#0b0b0c;--card:#111114;--card2:#17171a;--text:#f5f5f7;--muted:#bdbdc2;--accent:#7d7dfb;--accent2:#9f67ff;--border:#232329}}
-*{{box-sizing:border-box}}html,body{{height:100%;margin:0}}body{{display:flex;flex-direction:column;min-height:100%;background:linear-gradient(180deg,#0b0b0c,#0e0e12);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif}}
-.wrap{{max-width:980px;width:100%;margin:24px auto;padding:0 16px;flex:1 0 auto}}.search{{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:10px 12px;margin-bottom:16px;display:flex;gap:10px}}.search input{{width:100%;min-width:0;background:transparent;border:0;outline:0;color:var(--text);font-size:16px}}
-.card{{background:var(--card2);border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 10px 40px #0006}}.row{{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}}.thumb{{width:320px;max-width:100%;aspect-ratio:16/9;border-radius:14px;border:1px solid var(--border);object-fit:contain;background:#000}}.meta{{flex:1;min-width:260px}}h1{{margin:0 0 6px;font-size:20px}}h2{{margin:0;color:var(--muted);font-size:14px;font-weight:500;overflow-wrap:anywhere}}
-.btns{{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}}.btn{{appearance:none;border:1px solid var(--border);background:linear-gradient(180deg,#1d1d22,#15151a);color:var(--text);padding:10px 14px;border-radius:12px;text-decoration:none;display:inline-flex;gap:8px;align-items:center;justify-content:center;cursor:pointer;font:inherit}}.btn:hover{{border-color:#46465a;background:#22222a}}.btn:focus-visible,.search input:focus-visible{{outline:2px solid var(--accent);outline-offset:3px}}.small{{font-size:12px;color:var(--muted)}}.footer{{opacity:.6;font-size:12px;margin:12px 0;text-align:center}}.progress-card{{background:var(--card2);border:1px solid var(--border);border-radius:16px;padding:18px}}.bar-wrap{{height:12px;background:#121217;border:1px solid var(--border);border-radius:999px;overflow:hidden}}.bar{{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0%;transition:width .2s}}.error{{color:#ff9a9a;overflow-wrap:anywhere}}
-@media(max-width:800px){{.row{{flex-direction:column}}.thumb{{width:100%}}.meta{{min-width:0;width:100%}}}}@media(max-width:560px){{.btns{{display:grid;grid-template-columns:1fr 1fr}}}}@media(max-width:380px){{.btns{{grid-template-columns:1fr}}}}@media(prefers-reduced-motion:reduce){{.bar{{transition:none}}}}</style></head><body><main class="wrap"><form class="search" action="/" method="get"><input id="qinput" type="url" name="q" aria-label="Media URL" placeholder="Paste YouTube / TikTok / SoundCloud URL…" value="{esc(request.args.get('q', ''))}" required><button class="btn" type="submit">Go</button></form>{body}<div class="footer">{esc(footer)}</div></main></body></html>'''
+    esc = lambda value: html.escape(str(value), quote=True)
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+            f'<meta name="theme-color" content="#0b0b0c">'
+            f'<link rel="icon" href="{url_for("static", filename="favicon.png")}">'
+            f'<link rel="stylesheet" href="{url_for("static", filename="site.css", v="2")}">'
+            f'<title>{esc(title)}</title></head><body><main class="wrap">'
+            f'<form class="search" action="/" method="get">'
+            f'<input id="qinput" type="url" name="q" aria-label="Media URL" '
+            f'placeholder="Paste YouTube / TikTok / SoundCloud URL…" value="{esc(request.args.get("q", ""))}" required>'
+            f'<button class="btn" type="submit">Go</button></form>{body}'
+            f'<div class="footer">{esc(footer)}</div></main></body></html>')
 
 
 def error_page(message, status=400):
@@ -282,29 +349,38 @@ def detail_for(kind, info):
     creator = str(info.get('uploader') or info.get('channel') or info.get('artist') or 'Unknown')
     if kind == 'yt':
         height = max((f.get('height') or 0 for f in info.get('formats') or []), default=0)
-        buttons = []
+        primary = []
         if height > 1080:
-            buttons.append((f'Highest ({height}p)', url_for('yt_start', vid=item_id, mode='highest')))
-        buttons += [('HD (≤1080p)', url_for('yt_start', vid=item_id, mode='hd')),
-                    ('Audio (best)', url_for('yt_start', vid=item_id, mode='audio'))]
+            primary.append((f'Highest ({height}p)', url_for('yt_start', vid=item_id, mode='highest')))
+        primary.append(('HD (≤1080p)', url_for('yt_start', vid=item_id, mode='hd')))
+        rates = [f.get('abr') or f.get('tbr') or 0 for f in info.get('formats') or []
+                 if f.get('vcodec') in (None, 'none') and f.get('acodec') not in (None, 'none')]
+        kbps = round(max(rates)) if rates else 0
+        primary.append((f'Audio ({kbps} kbps)' if kbps else 'Audio (best)', url_for('yt_start', vid=item_id, mode='audio')))
+        secondary = []
         sub = subtitles(info)
         if sub:
-            buttons.append((f'Subtitles ({sub[2].upper()})', url_for('yt_subs', vid=item_id)))
+            secondary.append((f'Subtitles ({sub[2].upper()})', url_for('yt_subs', vid=item_id)))
         if image:
-            buttons.append(('Thumbnail', url_for('yt_thumb', vid=item_id)))
+            secondary.append(('Thumbnail', url_for('yt_thumb', vid=item_id)))
         media = f'<iframe class="thumb" src="https://www.youtube.com/embed/{quote(item_id)}?rel=0" title="YouTube video player" loading="lazy" allow="picture-in-picture; encrypted-media" allowfullscreen></iframe>'
     elif kind == 'tt':
-        buttons = [('Download Video', url_for('tt_start_video', vid=item_id))]
-        if image:
-            buttons.append(('Thumbnail', url_for('tt_thumb', vid=item_id)))
+        primary = [('Download Video', url_for('tt_start_video', vid=item_id))]
+        secondary = [('Thumbnail', url_for('tt_thumb', vid=item_id))] if image else []
         media = f'<img class="thumb" src="{html.escape(image or "", quote=True)}" loading="lazy" alt="Media cover">' if image else ''
     else:
-        buttons = [('Download MP3', url_for('sc_start_mp3', sid=item_id))]
-        if image:
-            buttons.append(('Cover', url_for('sc_cover', sid=item_id)))
+        primary = [('Download MP3', url_for('sc_start_mp3', sid=item_id))]
+        secondary = [('Cover', url_for('sc_cover', sid=item_id))] if image else []
         media = f'<img class="thumb" src="{html.escape(image or "", quote=True)}" loading="lazy" alt="Media cover">' if image else ''
-    controls = ''.join(f'<a class="btn" href="{html.escape(href, quote=True)}">{html.escape(label)}</a>' for label, href in buttons)
-    return page_shell(f'<div class="card"><div class="row">{media}<div class="meta"><h1>{html.escape(title)}</h1><h2>{html.escape(creator)}</h2><div class="btns">{controls}</div></div></div></div>', f'{title} - {creator}')
+    def controls(actions, group):
+        if not actions:
+            return ''
+        links = ''.join(f'<a class="btn" href="{html.escape(href, quote=True)}">{html.escape(label)}</a>' for label, href in actions)
+        return f'<div class="btns {group}{" single" if len(actions) == 1 else ""}">{links}</div>'
+    body = (f'<div class="card"><div class="row">{media}<div class="meta"><h1>{html.escape(title)}</h1>'
+            f'<h2>{html.escape(creator)}</h2>{controls(primary, "download-actions")}'
+            f'{controls(secondary, "utility-actions")}</div></div></div>')
+    return page_shell(body, f'{title} - {creator}')
 
 
 def get_detail(url, kind):
@@ -433,8 +509,10 @@ def job_snapshot(jid):
         result = job.copy()
         result['queue_position'] = sum(1 for j in JOBS.values() if j['stage'] == 'queued' and j['created'] < job['created']) + 1 if job['stage'] == 'queued' else 0
     if result['path'] and not Path(result['path']).is_file():
-        update_job(jid, path=None, stage='expired', error='This download has expired. Please start it again.')
-        result.update(path=None, stage='expired', error='This download has expired. Please start it again.')
+        update_job(jid, path=None, stage='expired', detail='Cached file expired', progress=None,
+                   error='This download has expired. Please start it again.')
+        result.update(path=None, stage='expired', detail='Cached file expired', progress=None,
+                      error='This download has expired. Please start it again.')
     return result
 
 
@@ -443,9 +521,24 @@ def job_view(jid):
     job = job_snapshot(jid)
     if not job:
         abort(404)
-    progress = float(job['progress'] or 0)
-    body = f'''<div class="card"><h1>{html.escape(job['title'])}</h1><div class="progress-card"><div style="display:flex;justify-content:space-between"><span class="small" id="stage" role="status" aria-live="polite">{html.escape(job['stage'])}</span><span class="small">Queue: <span id="qpos">{job['queue_position']}</span></span></div><div class="bar-wrap" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{progress}" id="progressWrap"><div class="bar" id="bar" style="width:{progress}%"></div></div><p class="small"><span id="pct">{progress:.1f}%</span> · <span id="speed">0 B/s</span><span id="eta"></span></p><div id="done" class="btns" style="display:none"><a class="btn" id="download" href="#">Download</a><a class="btn" href="/">New download</a></div><p id="err" class="error" role="alert" style="display:none"></p></div></div>
-<script>(()=>{{const jid={json.dumps(jid)},auto={str(request.args.get('own') == '1').lower()};const $=id=>document.getElementById(id);let failures=0,started=false;const fmt=v=>{{let n=v||0,i=0;while(n>=1024&&i<3){{n/=1024;i++}}return n.toFixed(1)+' '+['B/s','KB/s','MB/s','GB/s'][i]}};async function poll(){{if(document.hidden){{setTimeout(poll,2000);return}}try{{const r=await fetch('/job/'+jid+'/status',{{cache:'no-store'}});if(!r.ok)throw Error();const j=await r.json();failures=0;$('err').style.display='none';$('stage').textContent=j.stage;$('qpos').textContent=j.queue_position;$('bar').style.width=j.progress+'%';$('progressWrap').setAttribute('aria-valuenow',j.progress);$('pct').textContent=j.progress.toFixed(1)+'%';$('speed').textContent=fmt(j.speed);$('eta').textContent=j.eta==null?'':' · ETA '+Math.round(j.eta)+'s';if(j.error){{$('err').textContent=j.error;$('err').style.display='block';return}}if(j.ready&&j.file_url){{$('done').style.display='flex';$('download').href=j.file_url;if(auto&&!started){{started=true;const a=document.createElement('a');a.href=j.file_url;a.download='';document.body.append(a);a.click();a.remove()}}return}}setTimeout(poll,1200)}}catch(e){{failures++;$('err').style.display='block';$('err').textContent='Connection interrupted. Retrying…';setTimeout(poll,Math.min(10000,1000*2**Math.min(failures,4)))}}}}poll()}})();</script>'''
+    value = job['progress']
+    known = isinstance(value, (int, float)) and math.isfinite(value)
+    progress = max(0.0, min(100.0, value)) if known else 0.0
+    scope = html.escape(job['progress_scope'])
+    body = (f'<div class="card"><h1>{html.escape(job["title"])}</h1>'
+            f'<div class="progress-card"><div class="progress-head">'
+            f'<span class="small" id="stage" role="status" aria-live="polite">{html.escape(job["detail"])}</span>'
+            f'<span class="small" id="queue" {"" if job["stage"] == "queued" else "hidden"}>Queue: <span id="qpos">{job["queue_position"]}</span></span></div>'
+            f'<div class="bar-wrap {"" if known else "indeterminate"}" role="progressbar" aria-label="Download progress" '
+            f'aria-valuemin="0" aria-valuemax="100" {f"aria-valuenow={progress:.1f}" if known else ""} '
+            f'aria-valuetext="{scope}" id="progressWrap"><div class="bar" id="bar" style="width:{progress:.1f}%"></div></div>'
+            f'<p class="small progress-details"><span id="scope">{scope}</span>'
+            f'<span id="pct" {"" if known else "hidden"}>{progress:.1f}%</span>'
+            f'<span id="speed" hidden></span><span id="eta" hidden></span></p>'
+            f'<div id="done" class="btns" hidden><a class="btn" id="download" href="#">Download</a>'
+            f'<a class="btn" href="/">New download</a></div><p id="err" class="error" role="alert" hidden></p></div></div>'
+            f'<script>window.DOWNTIL_JOB={json.dumps({"id": jid, "auto": request.args.get("own") == "1"})};</script>'
+            f'<script src="{url_for("static", filename="job.js", v="2")}" defer></script>')
     return page_shell(body, 'Processing…')
 
 
@@ -454,15 +547,18 @@ def job_status(jid):
     job = job_snapshot(jid)
     if not job:
         return jsonify(error='Unknown job'), 404
-    return jsonify(id=jid, stage=job['stage'], progress=round(float(job['progress'] or 0), 1), speed=job['speed'] or 0,
-                   eta=job['eta'], queue_position=job['queue_position'], ready=bool(job['path']),
-                   file_url=url_for('job_file', jid=jid) if job['path'] else None, error=job['error'])
+    return jsonify(id=jid, stage=job['stage'], detail=job['detail'], progress=job['progress'],
+                   progress_scope=job['progress_scope'], speed=job['speed'], eta=job['eta'],
+                   estimated=job['estimated'], queue_position=job['queue_position'],
+                   ready=bool(job['path'] and job['stage'] == 'ready'),
+                   file_url=url_for('job_file', jid=jid) if job['path'] and job['stage'] == 'ready' else None,
+                   error=job['error'])
 
 
 @app.route('/job/<jid>/file')
 def job_file(jid):
     job = job_snapshot(jid)
-    if not job or not job['path']:
+    if not job or not job['path'] or job['stage'] != 'ready':
         abort(404)
     path = Path(job['path']).resolve()
     if not path.is_relative_to(ROOT) or not path.is_file():
@@ -510,7 +606,8 @@ def clean_expired(now=None):
     with LOCK:
         for jid, job in list(JOBS.items()):
             if job['path'] and not Path(job['path']).exists():
-                job.update(path=None, stage='expired', error='This download has expired. Please start it again.')
+                job.update(path=None, stage='expired', detail='Cached file expired', progress=None,
+                           error='This download has expired. Please start it again.')
             if job['created'] < now - 86400 and job['stage'] in ('ready', 'expired', 'error'):
                 JOBS.pop(jid)
                 if KEYS.get(job['key']) == jid:
